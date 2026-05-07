@@ -4,8 +4,8 @@ import jakarta.validation.constraints.Min;
 
 public record CreateVectorSyncJobRequest(
         @Min(1) long columnId,
-        Long collectionId,
-        Long indexId,
+        @Min(1) Long collectionId,
+        @Min(1) Long indexId,
         String jobType,
         String triggerType,
         String idempotencyKey,

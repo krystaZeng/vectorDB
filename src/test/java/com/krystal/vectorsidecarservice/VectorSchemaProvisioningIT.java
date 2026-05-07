@@ -99,6 +99,13 @@ class VectorSchemaProvisioningIT {
 
         long columnId = getDataLong(responseBody, "columnId");
 
+        String columnStatus = jdbcTemplate.queryForObject(
+                "SELECT STATUS FROM SYS_VECTOR_COLUMNS_ WHERE COLUMN_ID = ?",
+                String.class,
+                columnId
+        );
+        assertThat(columnStatus).isEqualTo("ACTIVE");
+
         mockMvc.perform(get("/api/v1/vector-collections").param("columnId", String.valueOf(columnId)))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true))
@@ -174,11 +181,31 @@ class VectorSchemaProvisioningIT {
                 String.class,
                 "fail_profile"
         );
+        String columnStatus = jdbcTemplate.queryForObject(
+                "SELECT STATUS FROM SYS_VECTOR_COLUMNS_ WHERE TABLE_NAME = ?",
+                String.class,
+                "DOC_FAIL"
+        );
+        String remark = jdbcTemplate.queryForObject(
+                "SELECT REMARK FROM SYS_VECTOR_COLUMNS_ WHERE TABLE_NAME = ?",
+                String.class,
+                "DOC_FAIL"
+        );
 
+        assertThat(columnStatus).isEqualTo("FAILED");
+        assertThat(remark).contains("mock qdrant failure");
         assertThat(collectionServingState).isEqualTo("BUILDING");
         assertThat(collectionStatus).isEqualTo("FAILED");
         assertThat(indexServingState).isEqualTo("OFFLINE");
         assertThat(indexStatus).isEqualTo("FAILED");
+
+        testVectorEngineAdminPort.setMode(TestVectorEngineAdminPort.Mode.SUCCESS);
+        mockMvc.perform(post("/api/v1/vector-schemas/tables")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(payload))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.containsString("use explicit retry/repair")));
     }
 
     private long getDataLong(String body, String field) {

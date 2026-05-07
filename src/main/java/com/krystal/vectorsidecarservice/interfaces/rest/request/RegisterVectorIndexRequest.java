@@ -5,7 +5,7 @@ import jakarta.validation.constraints.NotBlank;
 
 public record RegisterVectorIndexRequest(
         @Min(1) long columnId,
-        Long collectionId,
+        @Min(1) Long collectionId,
         @NotBlank String profileName,
         String indexType,
         String metricType,

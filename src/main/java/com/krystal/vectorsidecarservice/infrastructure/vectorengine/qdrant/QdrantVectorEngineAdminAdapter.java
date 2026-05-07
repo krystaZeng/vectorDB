@@ -2,6 +2,7 @@ package com.krystal.vectorsidecarservice.infrastructure.vectorengine.qdrant;
 
 import com.krystal.vectorsidecarservice.application.port.out.VectorEngineAdminPort;
 import com.krystal.vectorsidecarservice.common.exception.BizException;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatusCode;
@@ -13,6 +14,7 @@ import tools.jackson.databind.ObjectMapper;
 import tools.jackson.databind.node.ObjectNode;
 
 import java.util.Locale;
+import java.util.Optional;
 
 @Component
 public class QdrantVectorEngineAdminAdapter implements VectorEngineAdminPort {
@@ -22,6 +24,7 @@ public class QdrantVectorEngineAdminAdapter implements VectorEngineAdminPort {
     private final boolean enabled;
     private final String apiKey;
 
+    @Autowired
     public QdrantVectorEngineAdminAdapter(
             ObjectMapper objectMapper,
             @Value("${vector.engine.qdrant.base-url:http://127.0.0.1:6333}") String baseUrl,
@@ -32,6 +35,18 @@ public class QdrantVectorEngineAdminAdapter implements VectorEngineAdminPort {
         this.restClient = RestClient.builder()
                 .baseUrl(baseUrl)
                 .build();
+        this.enabled = enabled;
+        this.apiKey = apiKey;
+    }
+
+    QdrantVectorEngineAdminAdapter(
+            ObjectMapper objectMapper,
+            RestClient restClient,
+            boolean enabled,
+            String apiKey
+    ) {
+        this.objectMapper = objectMapper;
+        this.restClient = restClient;
         this.enabled = enabled;
         this.apiKey = apiKey;
     }
@@ -77,25 +92,24 @@ public class QdrantVectorEngineAdminAdapter implements VectorEngineAdminPort {
             return EnsureResult.skippedNoop("alias is blank, skipping");
         }
 
-        ObjectNode payload = objectMapper.createObjectNode();
-        ObjectNode action = objectMapper.createObjectNode();
-        ObjectNode createAlias = objectMapper.createObjectNode();
-        createAlias.put("collection_name", command.collectionName());
-        createAlias.put("alias_name", command.aliasName());
-        action.set("create_alias", createAlias);
-        payload.putArray("actions").add(action);
+        Optional<String> currentTarget = findAliasTarget(command.aliasName());
+        if (currentTarget.isPresent()) {
+            return ensureAliasPointsToExpectedCollection(
+                    command.aliasName(),
+                    command.collectionName(),
+                    currentTarget.get()
+            );
+        }
+
         try {
-            restClient.post()
-                    .uri("/collections/aliases")
-                    .headers(this::applyApiKey)
-                    .header(HttpHeaders.CONTENT_TYPE, "application/json")
-                    .body(payload)
-                    .retrieve()
-                    .toBodilessEntity();
+            createAlias(command.aliasName(), command.collectionName());
             return EnsureResult.created("alias created: " + command.aliasName());
         } catch (RestClientResponseException ex) {
             if (ex.getStatusCode().value() == 409) {
-                return EnsureResult.alreadyExists("alias already exists: " + command.aliasName());
+                String target = findAliasTarget(command.aliasName())
+                        .orElseThrow(() -> new BizException("qdrant alias exists but target cannot be resolved: "
+                                + command.aliasName()));
+                return ensureAliasPointsToExpectedCollection(command.aliasName(), command.collectionName(), target);
             }
             throw new BizException(formatHttpError("ensureAlias", ex), ex);
         }
@@ -143,6 +157,66 @@ public class QdrantVectorEngineAdminAdapter implements VectorEngineAdminPort {
             }
             throw new BizException(formatHttpError("collectionLookup", ex), ex);
         }
+    }
+
+    private Optional<String> findAliasTarget(String aliasName) {
+        try {
+            JsonNode response = restClient.get()
+                    .uri("/aliases")
+                    .headers(this::applyApiKey)
+                    .retrieve()
+                    .body(JsonNode.class);
+            if (response == null) {
+                throw new BizException("qdrant alias lookup returned empty response");
+            }
+            JsonNode aliases = response.path("result").path("aliases");
+            if (!aliases.isArray()) {
+                throw new BizException("qdrant alias lookup returned invalid response");
+            }
+            for (JsonNode alias : aliases.values()) {
+                if (aliasName.equals(alias.path("alias_name").asString(null))) {
+                    String target = alias.path("collection_name").asString(null);
+                    if (target == null || target.isBlank()) {
+                        throw new BizException("qdrant alias target cannot be resolved: " + aliasName);
+                    }
+                    return Optional.of(target);
+                }
+            }
+            return Optional.empty();
+        } catch (RestClientResponseException ex) {
+            throw new BizException(formatHttpError("aliasLookup", ex), ex);
+        }
+    }
+
+    private void createAlias(String aliasName, String collectionName) {
+        ObjectNode payload = objectMapper.createObjectNode();
+        ObjectNode action = objectMapper.createObjectNode();
+        ObjectNode createAlias = objectMapper.createObjectNode();
+        createAlias.put("collection_name", collectionName);
+        createAlias.put("alias_name", aliasName);
+        action.set("create_alias", createAlias);
+        payload.putArray("actions").add(action);
+
+        restClient.post()
+                .uri("/collections/aliases")
+                .headers(this::applyApiKey)
+                .header(HttpHeaders.CONTENT_TYPE, "application/json")
+                .body(payload)
+                .retrieve()
+                .toBodilessEntity();
+    }
+
+    private EnsureResult ensureAliasPointsToExpectedCollection(
+            String aliasName,
+            String expectedCollection,
+            String actualCollection
+    ) {
+        if (expectedCollection.equals(actualCollection)) {
+            return EnsureResult.alreadyExists("alias already points to collection: " + aliasName);
+        }
+        throw new BizException("qdrant alias " + aliasName
+                + " already points to " + actualCollection
+                + ", expected " + expectedCollection);
     }
 
     private ObjectNode buildCollectionPayload(EnsureCollectionCommand command) {

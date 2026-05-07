@@ -32,7 +32,10 @@ public class VectorRegistryController {
                         request.vectorColumn(),
                         request.dimension(),
                         request.metricType(),
-                        request.syncMode()
+                        request.syncMode(),
+                        null,
+                        null,
+                        null
                 )
         );
         return ApiResponse.ok(VectorColumnResponse.from(result));

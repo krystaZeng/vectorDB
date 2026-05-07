@@ -9,7 +9,10 @@ import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
 
+import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.util.List;
+import java.util.Optional;
 
 @Repository
 @RequiredArgsConstructor
@@ -31,6 +34,15 @@ public class JdbcVectorIndexRepository extends JdbcTimeSupport implements Vector
             FROM SYS_VECTOR_INDEXES_
             WHERE COLUMN_ID = ?
             ORDER BY CREATED_AT DESC
+            """;
+
+    private static final String FIND_BY_ID_SQL = """
+            SELECT
+                INDEX_ID, COLUMN_ID, COLLECTION_ID, PROFILE_NAME, INDEX_TYPE, METRIC_TYPE,
+                INDEX_PARAMS_JSON, SEARCH_PARAMS_JSON, PAYLOAD_INDEX_JSON, IS_DEFAULT, SERVING_STATE,
+                INDEX_STATUS, BUILD_VERSION, CREATED_AT, UPDATED_AT
+            FROM SYS_VECTOR_INDEXES_
+            WHERE INDEX_ID = ?
             """;
 
     private static final String UPDATE_STATUS_SQL = """
@@ -69,8 +81,24 @@ public class JdbcVectorIndexRepository extends JdbcTimeSupport implements Vector
     }
 
     @Override
+    public Optional<VectorIndexMeta> findById(long indexId) {
+        return jdbcTemplate.query(FIND_BY_ID_SQL, this::mapRow, indexId)
+                .stream()
+                .findFirst();
+    }
+
+    @Override
     public List<VectorIndexMeta> findByColumnId(long columnId) {
-        return jdbcTemplate.query(FIND_SQL, (rs, rowNum) -> new VectorIndexMeta(
+        return jdbcTemplate.query(FIND_SQL, this::mapRow, columnId);
+    }
+
+    @Override
+    public void updateStatus(long indexId, String servingState, String indexStatus) {
+        jdbcTemplate.update(UPDATE_STATUS_SQL, servingState, indexStatus, indexId);
+    }
+
+    private VectorIndexMeta mapRow(ResultSet rs, int rowNum) throws SQLException {
+        return new VectorIndexMeta(
                 rs.getLong("INDEX_ID"),
                 rs.getLong("COLUMN_ID"),
                 (Long) rs.getObject("COLLECTION_ID"),
@@ -86,11 +114,6 @@ public class JdbcVectorIndexRepository extends JdbcTimeSupport implements Vector
                 rs.getString("BUILD_VERSION"),
                 instant(rs.getTimestamp("CREATED_AT")),
                 instant(rs.getTimestamp("UPDATED_AT"))
-        ), columnId);
-    }
-
-    @Override
-    public void updateStatus(long indexId, String servingState, String indexStatus) {
-        jdbcTemplate.update(UPDATE_STATUS_SQL, servingState, indexStatus, indexId);
+        );
     }
 }

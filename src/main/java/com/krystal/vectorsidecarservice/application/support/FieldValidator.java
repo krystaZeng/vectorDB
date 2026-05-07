@@ -16,6 +16,36 @@ public final class FieldValidator {
         }
     }
 
+    public static Long optionalPositive(Long value, String fieldName) {
+        if (value != null && value <= 0) {
+            throw new BizException(fieldName + " must be greater than 0");
+        }
+        return value;
+    }
+
+    public static Integer optionalPositive(Integer value, String fieldName) {
+        if (value != null && value <= 0) {
+            throw new BizException(fieldName + " must be greater than 0");
+        }
+        return value;
+    }
+
+    public static long nonNegativeOrDefault(Long value, long defaultValue, String fieldName) {
+        long normalized = value == null ? defaultValue : value;
+        if (normalized < 0) {
+            throw new BizException(fieldName + " must be >= 0");
+        }
+        return normalized;
+    }
+
+    public static int nonNegativeOrDefault(Integer value, int defaultValue, String fieldName) {
+        int normalized = value == null ? defaultValue : value;
+        if (normalized < 0) {
+            throw new BizException(fieldName + " must be >= 0");
+        }
+        return normalized;
+    }
+
     public static String requireText(String value, String fieldName) {
         if (value == null || value.isBlank()) {
             throw new BizException(fieldName + " must not be blank");

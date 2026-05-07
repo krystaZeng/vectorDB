@@ -5,25 +5,38 @@ import com.krystal.vectorsidecarservice.application.port.in.RegisterVectorCollec
 import com.krystal.vectorsidecarservice.application.port.in.RegisterVectorColumnUseCase;
 import com.krystal.vectorsidecarservice.application.port.in.RegisterVectorIndexUseCase;
 import com.krystal.vectorsidecarservice.application.port.out.RelationalSchemaPort;
-import com.krystal.vectorsidecarservice.application.port.out.VectorCollectionPort;
 import com.krystal.vectorsidecarservice.application.port.out.VectorEngineAdminPort;
-import com.krystal.vectorsidecarservice.application.port.out.VectorIndexPort;
+import com.krystal.vectorsidecarservice.application.port.out.VectorMetadataPort;
+import com.krystal.vectorsidecarservice.application.registry.lifecycle.VectorColumnLifecycle;
+import com.krystal.vectorsidecarservice.application.registry.lifecycle.VectorColumnLifecycleService;
+import com.krystal.vectorsidecarservice.application.registry.lifecycle.VectorCollectionLifecycle;
+import com.krystal.vectorsidecarservice.application.registry.lifecycle.VectorCollectionLifecycleService;
+import com.krystal.vectorsidecarservice.application.registry.lifecycle.VectorIndexLifecycle;
+import com.krystal.vectorsidecarservice.application.registry.lifecycle.VectorIndexLifecycleService;
 import com.krystal.vectorsidecarservice.common.exception.BizException;
 import com.krystal.vectorsidecarservice.domain.registry.VectorCollectionMeta;
 import com.krystal.vectorsidecarservice.domain.registry.VectorColumnMeta;
 import com.krystal.vectorsidecarservice.domain.registry.VectorIndexMeta;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
+import java.util.HexFormat;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Optional;
 import java.util.Set;
 import java.util.regex.Pattern;
 
 @Service
 @RequiredArgsConstructor
+@Slf4j
 public class CreateVectorTableService implements CreateVectorTableUseCase {
 
     private static final String DEFAULT_SCHEMA = "PUBLIC";
@@ -35,14 +48,17 @@ public class CreateVectorTableService implements CreateVectorTableUseCase {
     private static final String DEFAULT_COLLECTION_VERSION = "v1";
     private static final String DEFAULT_INDEX_PROFILE = "default";
     private static final String DEFAULT_INDEX_BUILD_VERSION = "v1";
+    private static final int MAX_REMARK_LEN = 1024;
     private static final Pattern IDENTIFIER_PATTERN = Pattern.compile("^[A-Za-z][A-Za-z0-9_]*$");
 
     private final RelationalSchemaPort relationalSchemaPort;
+    private final VectorMetadataPort vectorMetadataPort;
     private final RegisterVectorColumnUseCase registerVectorColumnUseCase;
     private final RegisterVectorCollectionUseCase registerVectorCollectionUseCase;
     private final RegisterVectorIndexUseCase registerVectorIndexUseCase;
-    private final VectorCollectionPort vectorCollectionPort;
-    private final VectorIndexPort vectorIndexPort;
+    private final VectorColumnLifecycleService vectorColumnLifecycleService;
+    private final VectorCollectionLifecycleService vectorCollectionLifecycleService;
+    private final VectorIndexLifecycleService vectorIndexLifecycleService;
     private final VectorEngineAdminRouter vectorEngineAdminRouter;
     private final AltibaseCreateTableSqlBuilder sqlBuilder;
     private final TransactionTemplate transactionTemplate;
@@ -81,9 +97,21 @@ public class CreateVectorTableService implements CreateVectorTableUseCase {
                 vectorColumn,
                 relationalSchemaPort.databaseDialect()
         );
+        String definitionHash = definitionHash(
+                command,
+                engineType,
+                autoRegisterCollection,
+                autoRegisterIndex,
+                schemaName,
+                tableName,
+                primaryKey,
+                scalarColumns,
+                vectorColumn,
+                ddl
+        );
 
         boolean ifNotExists = command.ifNotExists() == null || command.ifNotExists();
-        StageAResult stageA = transactionTemplate.execute(status -> runStageA(
+        StageAResult stageA = transactionTemplate.execute(status -> prepareMetadata(
                 command,
                 engineType,
                 autoRegisterCollection,
@@ -92,31 +120,57 @@ public class CreateVectorTableService implements CreateVectorTableUseCase {
                 tableName,
                 primaryKey,
                 vectorColumn,
-                ddl,
-                ifNotExists
+                definitionHash
         ));
         if (stageA == null) {
             throw new BizException("failed to initialize create table workflow");
+        }
+        if (stageA.workflowReady()) {
+            validateRelationalTable(schemaName, tableName, primaryKey, scalarColumns, vectorColumn);
+            return createResult(schemaName, tableName, vectorColumn, stageA, DdlResult.ALREADY_EXISTS_AND_MATCHED, ddl);
+        }
+
+        DdlResult ddlResult;
+        try {
+            ddlResult = ensureRelationalTable(
+                    schemaName,
+                    tableName,
+                    primaryKey,
+                    scalarColumns,
+                    vectorColumn,
+                    ddl,
+                    ifNotExists || stageA.metadataExisted()
+            );
+        } catch (RuntimeException ex) {
+            markWorkflowFailed(stageA.columnMeta().columnId(), stageA.collectionMeta(), stageA.indexMeta(), ex);
+            throw ex;
         }
 
         if (stageA.collectionMeta() != null) {
             try {
                 ProvisioningOutcome outcome = provisionPhysicalResources(stageA.collectionMeta(), stageA.indexMeta());
                 transactionTemplate.executeWithoutResult(status ->
-                        finalizeProvisioningStatus(stageA.collectionMeta().collectionId(), stageA.indexMeta(), outcome)
+                        finalizeProvisioningStatus(stageA.columnMeta().columnId(), stageA.collectionMeta(), stageA.indexMeta(), outcome)
                 );
             } catch (RuntimeException ex) {
-                try {
-                    transactionTemplate.executeWithoutResult(status ->
-                            markProvisioningFailed(stageA.collectionMeta().collectionId(), stageA.indexMeta())
-                    );
-                } catch (RuntimeException statusEx) {
-                    ex.addSuppressed(statusEx);
-                }
+                markWorkflowFailed(stageA.columnMeta().columnId(), stageA.collectionMeta(), stageA.indexMeta(), ex);
                 throw new BizException("failed to provision vector engine resources: " + ex.getMessage(), ex);
             }
+        } else {
+            transactionTemplate.executeWithoutResult(status -> markColumnActive(stageA.columnMeta().columnId()));
         }
 
+        return createResult(schemaName, tableName, vectorColumn, stageA, ddlResult, ddl);
+    }
+
+    private CreateVectorTableResult createResult(
+            String schemaName,
+            String tableName,
+            VectorColumnSpec vectorColumn,
+            StageAResult stageA,
+            DdlResult ddlResult,
+            String ddl
+    ) {
         return new CreateVectorTableResult(
                 schemaName,
                 tableName,
@@ -127,12 +181,12 @@ public class CreateVectorTableService implements CreateVectorTableUseCase {
                 stageA.collectionMeta() == null ? null : stageA.collectionMeta().collectionId(),
                 stageA.indexMeta() == null ? null : stageA.indexMeta().indexId(),
                 stageA.indexProfileName(),
-                stageA.ddlExecuted(),
+                ddlResult.createdByThisAttempt(),
                 ddl
         );
     }
 
-    private StageAResult runStageA(
+    private StageAResult prepareMetadata(
             CreateVectorTableCommand command,
             String engineType,
             boolean autoRegisterCollection,
@@ -141,17 +195,143 @@ public class CreateVectorTableService implements CreateVectorTableUseCase {
             String tableName,
             PrimaryKeySpec primaryKey,
             VectorColumnSpec vectorColumn,
-            String ddl,
-            boolean ifNotExists
+            String definitionHash
     ) {
-        boolean ddlExecuted = true;
-        if (ifNotExists && relationalSchemaPort.tableExists(schemaName, tableName)) {
-            ddlExecuted = false;
-        } else {
-            relationalSchemaPort.executeDdl(ddl);
+        String tenantId = normalizeWithDefault(command.tenantId(), DEFAULT_TENANT);
+        Optional<VectorColumnMeta> existing = vectorMetadataPort.findByIdentity(
+                tenantId,
+                schemaName,
+                tableName,
+                vectorColumn.name()
+        );
+        ColumnResolution columnResolution = existing
+                .map(meta -> new ColumnResolution(resolveExistingColumn(meta, definitionHash), true))
+                .orElseGet(() -> registerOrLoadBuildingColumn(
+                        command,
+                        tenantId,
+                        schemaName,
+                        tableName,
+                        primaryKey,
+                        vectorColumn,
+                        definitionHash
+                ));
+        VectorColumnMeta columnMeta = columnResolution.columnMeta();
+        boolean metadataExisted = columnResolution.metadataExisted();
+
+        if (!autoRegisterCollection) {
+            return new StageAResult(
+                    columnMeta,
+                    null,
+                    null,
+                    null,
+                    metadataExisted,
+                    isWorkflowReady(columnMeta, null, null, false, false)
+            );
         }
 
-        VectorColumnMeta columnMeta = registerVectorColumnUseCase.register(
+        VectorCollectionMeta collectionMeta = existingCollection(columnMeta.columnId())
+                .orElseGet(() -> registerCreatingCollection(command, engineType, schemaName, tableName, vectorColumn, columnMeta));
+
+        VectorIndexMeta indexMeta = null;
+        String indexProfileName = null;
+        if (autoRegisterIndex) {
+            indexProfileName = normalizeProfileName(command.defaultIndexProfileName());
+            String finalIndexProfileName = indexProfileName;
+            indexMeta = existingIndex(columnMeta.columnId(), finalIndexProfileName)
+                    .orElseGet(() -> registerCreatingIndex(vectorColumn, columnMeta, collectionMeta, finalIndexProfileName));
+        }
+        return new StageAResult(
+                columnMeta,
+                collectionMeta,
+                indexMeta,
+                indexProfileName,
+                metadataExisted,
+                isWorkflowReady(columnMeta, collectionMeta, indexMeta, autoRegisterCollection, autoRegisterIndex)
+        );
+    }
+
+    private boolean isWorkflowReady(
+            VectorColumnMeta columnMeta,
+            VectorCollectionMeta collectionMeta,
+            VectorIndexMeta indexMeta,
+            boolean collectionRequired,
+            boolean indexRequired
+    ) {
+        if (!VectorColumnLifecycle.ACTIVE.status().equals(columnMeta.status())) {
+            return false;
+        }
+        if (!collectionRequired) {
+            return true;
+        }
+        if (collectionMeta == null || !"ACTIVE".equals(collectionMeta.servingState())
+                || !"READY".equals(collectionMeta.collectionStatus())) {
+            return false;
+        }
+        if (!indexRequired) {
+            return true;
+        }
+        return indexMeta != null
+                && "ONLINE".equals(indexMeta.servingState())
+                && "READY".equals(indexMeta.indexStatus());
+    }
+
+    private VectorColumnMeta resolveExistingColumn(VectorColumnMeta existing, String definitionHash) {
+        if (!definitionHash.equals(existing.definitionHash())) {
+            throw new BizException("vector column definition conflicts with existing metadata: "
+                    + existing.schemaName() + "." + existing.tableName() + "." + existing.vectorColumn());
+        }
+        return switch (VectorColumnLifecycle.normalize(existing.status())) {
+            case BUILDING, ACTIVE -> existing;
+            case FAILED -> throw new BizException("vector column is FAILED; use explicit retry/repair: "
+                    + existing.schemaName() + "." + existing.tableName() + "." + existing.vectorColumn());
+            case DISABLED -> throw new BizException("vector column is DISABLED: "
+                    + existing.schemaName() + "." + existing.tableName() + "." + existing.vectorColumn());
+        };
+    }
+
+    private ColumnResolution registerOrLoadBuildingColumn(
+            CreateVectorTableCommand command,
+            String tenantId,
+            String schemaName,
+            String tableName,
+            PrimaryKeySpec primaryKey,
+            VectorColumnSpec vectorColumn,
+            String definitionHash
+    ) {
+        try {
+            return new ColumnResolution(
+                    registerBuildingColumn(command, schemaName, tableName, primaryKey, vectorColumn, definitionHash),
+                    false
+            );
+        } catch (BizException ex) {
+            Optional<VectorColumnMeta> racedMetadata = vectorMetadataPort.findByIdentity(
+                    tenantId,
+                    schemaName,
+                    tableName,
+                    vectorColumn.name()
+            );
+            if (racedMetadata.isEmpty()) {
+                throw ex;
+            }
+            log.info(
+                    "Vector column metadata already exists after concurrent registration; resolving as retry: {}.{}.{}",
+                    schemaName,
+                    tableName,
+                    vectorColumn.name()
+            );
+            return new ColumnResolution(resolveExistingColumn(racedMetadata.get(), definitionHash), true);
+        }
+    }
+
+    private VectorColumnMeta registerBuildingColumn(
+            CreateVectorTableCommand command,
+            String schemaName,
+            String tableName,
+            PrimaryKeySpec primaryKey,
+            VectorColumnSpec vectorColumn,
+            String definitionHash
+    ) {
+        return registerVectorColumnUseCase.register(
                 new RegisterVectorColumnUseCase.RegisterVectorColumnCommand(
                         command.tenantId(),
                         schemaName,
@@ -160,15 +340,30 @@ public class CreateVectorTableService implements CreateVectorTableUseCase {
                         vectorColumn.name(),
                         vectorColumn.dimension(),
                         vectorColumn.metricType(),
-                        vectorColumn.syncMode()
+                        vectorColumn.syncMode(),
+                        VectorColumnLifecycle.BUILDING.status(),
+                        definitionHash,
+                        null
                 )
         );
+    }
 
-        if (!autoRegisterCollection) {
-            return new StageAResult(columnMeta, null, null, null, ddlExecuted);
-        }
+    private Optional<VectorCollectionMeta> existingCollection(long columnId) {
+        return registerVectorCollectionUseCase.listByColumnId(columnId)
+                .stream()
+                .filter(meta -> DEFAULT_COLLECTION_VERSION.equals(meta.collectionVersion()))
+                .findFirst();
+    }
 
-        VectorCollectionMeta collectionMeta = registerVectorCollectionUseCase.register(
+    private VectorCollectionMeta registerCreatingCollection(
+            CreateVectorTableCommand command,
+            String engineType,
+            String schemaName,
+            String tableName,
+            VectorColumnSpec vectorColumn,
+            VectorColumnMeta columnMeta
+    ) {
+        return registerVectorCollectionUseCase.register(
                 new RegisterVectorCollectionUseCase.RegisterVectorCollectionCommand(
                         columnMeta.columnId(),
                         engineType,
@@ -180,8 +375,8 @@ public class CreateVectorTableService implements CreateVectorTableUseCase {
                         vectorColumn.dimension(),
                         toCollectionDistanceMetric(vectorColumn.metricType()),
                         "UINT64",
-                        "BUILDING",
-                        "CREATING",
+                        VectorCollectionLifecycle.CREATING.servingState(),
+                        VectorCollectionLifecycle.CREATING.collectionStatus(),
                         null,
                         null,
                         null,
@@ -191,50 +386,210 @@ public class CreateVectorTableService implements CreateVectorTableUseCase {
                         null
                 )
         );
-
-        VectorIndexMeta indexMeta = null;
-        String indexProfileName = null;
-        if (autoRegisterIndex) {
-            indexProfileName = normalizeProfileName(command.defaultIndexProfileName());
-            indexMeta = registerVectorIndexUseCase.register(
-                    new RegisterVectorIndexUseCase.RegisterVectorIndexCommand(
-                            columnMeta.columnId(),
-                            collectionMeta.collectionId(),
-                            indexProfileName,
-                            "HNSW",
-                            vectorColumn.metricType(),
-                            null,
-                            null,
-                            null,
-                            "Y",
-                            "OFFLINE",
-                            "CREATING",
-                            DEFAULT_INDEX_BUILD_VERSION
-                    )
-            );
-        }
-        return new StageAResult(columnMeta, collectionMeta, indexMeta, indexProfileName, ddlExecuted);
     }
 
-    private void finalizeProvisioningStatus(Long collectionId, VectorIndexMeta indexMeta, ProvisioningOutcome outcome) {
+    private Optional<VectorIndexMeta> existingIndex(long columnId, String profileName) {
+        return registerVectorIndexUseCase.listByColumnId(columnId)
+                .stream()
+                .filter(meta -> profileName.equals(meta.profileName()))
+                .findFirst();
+    }
+
+    private VectorIndexMeta registerCreatingIndex(
+            VectorColumnSpec vectorColumn,
+            VectorColumnMeta columnMeta,
+            VectorCollectionMeta collectionMeta,
+            String indexProfileName
+    ) {
+        return registerVectorIndexUseCase.register(
+                new RegisterVectorIndexUseCase.RegisterVectorIndexCommand(
+                        columnMeta.columnId(),
+                        collectionMeta.collectionId(),
+                        indexProfileName,
+                        "HNSW",
+                        vectorColumn.metricType(),
+                        null,
+                        null,
+                        null,
+                        "Y",
+                        VectorIndexLifecycle.CREATING.servingState(),
+                        VectorIndexLifecycle.CREATING.indexStatus(),
+                        DEFAULT_INDEX_BUILD_VERSION
+                )
+        );
+    }
+
+    private DdlResult ensureRelationalTable(
+            String schemaName,
+            String tableName,
+            PrimaryKeySpec primaryKey,
+            List<ScalarColumnSpec> scalarColumns,
+            VectorColumnSpec vectorColumn,
+            String ddl,
+            boolean ifNotExists
+    ) {
+        if (relationalSchemaPort.tableExists(schemaName, tableName)) {
+            if (!ifNotExists) {
+                throw new BizException("table already exists: " + schemaName + "." + tableName);
+            }
+            validateRelationalTable(schemaName, tableName, primaryKey, scalarColumns, vectorColumn);
+            return DdlResult.ALREADY_EXISTS_AND_MATCHED;
+        }
+        try {
+            relationalSchemaPort.executeDdl(ddl);
+            return DdlResult.CREATED_BY_THIS_ATTEMPT;
+        } catch (RelationalSchemaPort.DdlExecutionException ex) {
+            return recoverAfterDdlFailure(
+                    schemaName,
+                    tableName,
+                    primaryKey,
+                    scalarColumns,
+                    vectorColumn,
+                    ifNotExists,
+                    ex
+            );
+        }
+    }
+
+    private DdlResult recoverAfterDdlFailure(
+            String schemaName,
+            String tableName,
+            PrimaryKeySpec primaryKey,
+            List<ScalarColumnSpec> scalarColumns,
+            VectorColumnSpec vectorColumn,
+            boolean ifNotExists,
+            RelationalSchemaPort.DdlExecutionException ex
+    ) {
+        if (!ifNotExists || !canRecoverByCheckingTable(ex.failureKind())) {
+            log.warn(
+                    "DDL failed for {}.{} with kind {}; not treating it as idempotent",
+                    schemaName,
+                    tableName,
+                    ex.failureKind(),
+                    ex
+            );
+            throw ex;
+        }
+        log.warn(
+                "DDL failed for {}.{} with kind {}; rechecking table definition before idempotent recovery",
+                schemaName,
+                tableName,
+                ex.failureKind(),
+                ex
+        );
+        if (!relationalSchemaPort.tableExists(schemaName, tableName)) {
+            throw ex;
+        }
+        validateRelationalTable(schemaName, tableName, primaryKey, scalarColumns, vectorColumn);
+        log.info("DDL target table already exists and matches expected definition: {}.{}", schemaName, tableName);
+        return DdlResult.ALREADY_EXISTS_AND_MATCHED;
+    }
+
+    private boolean canRecoverByCheckingTable(RelationalSchemaPort.DdlFailureKind failureKind) {
+        return failureKind == RelationalSchemaPort.DdlFailureKind.OBJECT_ALREADY_EXISTS
+                || failureKind == RelationalSchemaPort.DdlFailureKind.UNKNOWN_EXECUTION_STATE;
+    }
+
+    private void validateRelationalTable(
+            String schemaName,
+            String tableName,
+            PrimaryKeySpec primaryKey,
+            List<ScalarColumnSpec> scalarColumns,
+            VectorColumnSpec vectorColumn
+    ) {
+        relationalSchemaPort.validateTableDefinition(tableDefinition(schemaName, tableName, primaryKey, scalarColumns, vectorColumn));
+    }
+
+    private RelationalSchemaPort.TableDefinition tableDefinition(
+            String schemaName,
+            String tableName,
+            PrimaryKeySpec primaryKey,
+            List<ScalarColumnSpec> scalarColumns,
+            VectorColumnSpec vectorColumn
+    ) {
+        List<RelationalSchemaPort.ColumnDefinition> columns = new ArrayList<>();
+        columns.add(new RelationalSchemaPort.ColumnDefinition(primaryKey.name(), scalarType(primaryKey.type()), scalarLength(primaryKey.type(), null), false));
+        for (ScalarColumnSpec scalarColumn : scalarColumns) {
+            columns.add(new RelationalSchemaPort.ColumnDefinition(
+                    scalarColumn.name(),
+                    scalarType(scalarColumn.type()),
+                    scalarLength(scalarColumn.type(), scalarColumn.length()),
+                    scalarColumn.nullable()
+            ));
+        }
+        columns.add(new RelationalSchemaPort.ColumnDefinition(
+                vectorColumn.name(),
+                vectorStorageType(relationalSchemaPort.databaseDialect()),
+                vectorStorageLength(vectorColumn),
+                vectorColumn.nullable()
+        ));
+        return new RelationalSchemaPort.TableDefinition(schemaName, tableName, primaryKey.name(), columns);
+    }
+
+    private void finalizeProvisioningStatus(
+            long columnId,
+            VectorCollectionMeta collectionMeta,
+            VectorIndexMeta indexMeta,
+            ProvisioningOutcome outcome
+    ) {
         if (outcome.engineDisabled()) {
-            vectorCollectionPort.updateStatus(collectionId, "BUILDING", "CREATING");
+            vectorCollectionLifecycleService.markCreating(collectionMeta.collectionId());
             if (indexMeta != null) {
-                vectorIndexPort.updateStatus(indexMeta.indexId(), "OFFLINE", "CREATING");
+                vectorIndexLifecycleService.markCreating(indexMeta.indexId());
             }
             return;
         }
-        vectorCollectionPort.updateStatus(collectionId, "ACTIVE", "READY");
+        vectorCollectionLifecycleService.markReady(collectionMeta.collectionId());
         if (indexMeta != null) {
-            vectorIndexPort.updateStatus(indexMeta.indexId(), "ONLINE", "READY");
+            vectorIndexLifecycleService.markReady(indexMeta.indexId());
+        }
+        markColumnActive(columnId);
+    }
+
+    private void markWorkflowFailed(long columnId, VectorCollectionMeta collectionMeta, VectorIndexMeta indexMeta, RuntimeException ex) {
+        try {
+            transactionTemplate.executeWithoutResult(status -> {
+                vectorColumnLifecycleService.markFailed(columnId, truncateRemark(ex.getMessage()));
+                if (collectionMeta != null) {
+                    markCollectionFailedIfUnready(collectionMeta);
+                }
+                if (indexMeta != null) {
+                    markIndexFailedIfUnready(indexMeta);
+                }
+            });
+        } catch (RuntimeException statusEx) {
+            ex.addSuppressed(statusEx);
         }
     }
 
-    private void markProvisioningFailed(Long collectionId, VectorIndexMeta indexMeta) {
-        vectorCollectionPort.updateStatus(collectionId, "BUILDING", "FAILED");
-        if (indexMeta != null) {
-            vectorIndexPort.updateStatus(indexMeta.indexId(), "OFFLINE", "FAILED");
+    private void markCollectionFailedIfUnready(VectorCollectionMeta collectionMeta) {
+        VectorCollectionLifecycle lifecycle = VectorCollectionLifecycle.fromPersisted(
+                collectionMeta.servingState(),
+                collectionMeta.collectionStatus()
+        );
+        if (lifecycle == VectorCollectionLifecycle.READY
+                || lifecycle == VectorCollectionLifecycle.DEPRECATED
+                || lifecycle == VectorCollectionLifecycle.DROPPED) {
+            return;
         }
+        vectorCollectionLifecycleService.markFailed(collectionMeta.collectionId());
+    }
+
+    private void markIndexFailedIfUnready(VectorIndexMeta indexMeta) {
+        VectorIndexLifecycle lifecycle = VectorIndexLifecycle.fromPersisted(
+                indexMeta.servingState(),
+                indexMeta.indexStatus()
+        );
+        if (lifecycle == VectorIndexLifecycle.READY
+                || lifecycle == VectorIndexLifecycle.OFFLINE_READY
+                || lifecycle == VectorIndexLifecycle.CANARY_READY) {
+            return;
+        }
+        vectorIndexLifecycleService.markFailed(indexMeta.indexId());
+    }
+
+    private void markColumnActive(long columnId) {
+        vectorColumnLifecycleService.markActive(columnId);
     }
 
     private PrimaryKeySpec normalizePrimaryKey(PrimaryKeySpec primaryKey) {
@@ -317,6 +672,94 @@ public class CreateVectorTableService implements CreateVectorTableUseCase {
         };
     }
 
+    private String scalarType(String value) {
+        return switch (value.toUpperCase(Locale.ROOT)) {
+            case "INT" -> "INTEGER";
+            default -> value.toUpperCase(Locale.ROOT);
+        };
+    }
+
+    private Integer scalarLength(String type, Integer length) {
+        String normalized = type.toUpperCase(Locale.ROOT);
+        return normalized.equals("VARCHAR") || normalized.equals("CHAR") ? length : null;
+    }
+
+    private String vectorStorageType(RelationalSchemaPort.DatabaseDialect dialect) {
+        return dialect == RelationalSchemaPort.DatabaseDialect.ALTIBASE ? "VARBYTE" : "VARBINARY";
+    }
+
+    private int vectorStorageLength(VectorColumnSpec vectorColumn) {
+        int bytesPerElement = switch (vectorColumn.elementType().toUpperCase(Locale.ROOT)) {
+            case "FLOAT32" -> 4;
+            case "FLOAT16" -> 2;
+            case "INT8" -> 1;
+            default -> throw new BizException("vectorColumn.elementType must be one of FLOAT32, FLOAT16, INT8");
+        };
+        long storageLength = (long) vectorColumn.dimension() * bytesPerElement;
+        if (storageLength > Integer.MAX_VALUE) {
+            throw new BizException("vector storage length is too large");
+        }
+        return (int) storageLength;
+    }
+
+    private String definitionHash(
+            CreateVectorTableCommand command,
+            String engineType,
+            boolean autoRegisterCollection,
+            boolean autoRegisterIndex,
+            String schemaName,
+            String tableName,
+            PrimaryKeySpec primaryKey,
+            List<ScalarColumnSpec> scalarColumns,
+            VectorColumnSpec vectorColumn,
+            String ddl
+    ) {
+        StringBuilder canonical = new StringBuilder();
+        canonical.append("tenant=").append(normalizeWithDefault(command.tenantId(), DEFAULT_TENANT)).append('\n');
+        canonical.append("schema=").append(schemaName).append('\n');
+        canonical.append("table=").append(tableName).append('\n');
+        canonical.append("engine=").append(engineType).append('\n');
+        canonical.append("autoCollection=").append(autoRegisterCollection).append('\n');
+        canonical.append("autoIndex=").append(autoRegisterIndex).append('\n');
+        canonical.append("indexProfile=").append(normalizeProfileName(command.defaultIndexProfileName())).append('\n');
+        canonical.append("pk=").append(primaryKey.name()).append(':').append(primaryKey.type()).append('\n');
+        for (ScalarColumnSpec scalarColumn : scalarColumns) {
+            canonical.append("scalar=")
+                    .append(scalarColumn.name()).append(':')
+                    .append(scalarColumn.type()).append(':')
+                    .append(scalarColumn.length()).append(':')
+                    .append(scalarColumn.nullable())
+                    .append('\n');
+        }
+        canonical.append("vector=")
+                .append(vectorColumn.name()).append(':')
+                .append(vectorColumn.dimension()).append(':')
+                .append(vectorColumn.elementType()).append(':')
+                .append(vectorColumn.metricType()).append(':')
+                .append(vectorColumn.syncMode()).append(':')
+                .append(vectorColumn.nullable())
+                .append('\n');
+        canonical.append("ddl=").append(ddl);
+        return sha256(canonical.toString());
+    }
+
+    private String sha256(String value) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            return HexFormat.of().formatHex(digest.digest(value.getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException ex) {
+            throw new IllegalStateException("SHA-256 is not available", ex);
+        }
+    }
+
+    private String truncateRemark(String remark) {
+        if (remark == null || remark.isBlank()) {
+            return "workflow failed";
+        }
+        String normalized = remark.trim();
+        return normalized.length() <= MAX_REMARK_LEN ? normalized : normalized.substring(0, MAX_REMARK_LEN);
+    }
+
     private ProvisioningOutcome provisionPhysicalResources(VectorCollectionMeta collectionMeta, VectorIndexMeta indexMeta) {
         VectorEngineAdminPort adminPort = vectorEngineAdminRouter.get(collectionMeta.engineType());
         VectorEngineAdminPort.EnsureResult collectionResult = adminPort.ensureCollection(
@@ -381,8 +824,21 @@ public class CreateVectorTableService implements CreateVectorTableUseCase {
             VectorCollectionMeta collectionMeta,
             VectorIndexMeta indexMeta,
             String indexProfileName,
-            boolean ddlExecuted
+            boolean metadataExisted,
+            boolean workflowReady
     ) {
+    }
+
+    private record ColumnResolution(VectorColumnMeta columnMeta, boolean metadataExisted) {
+    }
+
+    private enum DdlResult {
+        CREATED_BY_THIS_ATTEMPT,
+        ALREADY_EXISTS_AND_MATCHED;
+
+        boolean createdByThisAttempt() {
+            return this == CREATED_BY_THIS_ATTEMPT;
+        }
     }
 
     private String toCollectionDistanceMetric(String metricType) {

@@ -9,7 +9,10 @@ import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
 
+import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.util.List;
+import java.util.Optional;
 
 @Repository
 @RequiredArgsConstructor
@@ -35,6 +38,17 @@ public class JdbcVectorCollectionRepository extends JdbcTimeSupport implements V
             FROM SYS_VECTOR_COLLECTIONS_
             WHERE COLUMN_ID = ?
             ORDER BY CREATED_AT DESC
+            """;
+
+    private static final String FIND_BY_ID_SQL = """
+            SELECT
+                COLLECTION_ID, COLUMN_ID, ENGINE_TYPE, NAMESPACE_NAME, COLLECTION_NAME, ALIAS_NAME,
+                COLLECTION_VERSION, SERVING_STATE, COLLECTION_STATUS, QDRANT_VECTOR_NAME, QDRANT_ID_TYPE,
+                DISTANCE_METRIC, VECTOR_DIM, SHARD_NUMBER, REPLICATION_FACTOR, WRITE_CONSISTENCY_FACTOR,
+                ON_DISK_PAYLOAD, HNSW_CONFIG_JSON, QUANTIZATION_CONFIG_JSON, COLLECTION_CONFIG_JSON,
+                CREATED_AT, UPDATED_AT
+            FROM SYS_VECTOR_COLLECTIONS_
+            WHERE COLLECTION_ID = ?
             """;
 
     private static final String UPDATE_STATUS_SQL = """
@@ -80,8 +94,24 @@ public class JdbcVectorCollectionRepository extends JdbcTimeSupport implements V
     }
 
     @Override
+    public Optional<VectorCollectionMeta> findById(long collectionId) {
+        return jdbcTemplate.query(FIND_BY_ID_SQL, this::mapRow, collectionId)
+                .stream()
+                .findFirst();
+    }
+
+    @Override
     public List<VectorCollectionMeta> findByColumnId(long columnId) {
-        return jdbcTemplate.query(FIND_SQL, (rs, rowNum) -> new VectorCollectionMeta(
+        return jdbcTemplate.query(FIND_SQL, this::mapRow, columnId);
+    }
+
+    @Override
+    public void updateStatus(long collectionId, String servingState, String collectionStatus) {
+        jdbcTemplate.update(UPDATE_STATUS_SQL, servingState, collectionStatus, collectionId);
+    }
+
+    private VectorCollectionMeta mapRow(ResultSet rs, int rowNum) throws SQLException {
+        return new VectorCollectionMeta(
                 rs.getLong("COLLECTION_ID"),
                 rs.getLong("COLUMN_ID"),
                 rs.getString("ENGINE_TYPE"),
@@ -104,11 +134,6 @@ public class JdbcVectorCollectionRepository extends JdbcTimeSupport implements V
                 rs.getString("COLLECTION_CONFIG_JSON"),
                 instant(rs.getTimestamp("CREATED_AT")),
                 instant(rs.getTimestamp("UPDATED_AT"))
-        ), columnId);
-    }
-
-    @Override
-    public void updateStatus(long collectionId, String servingState, String collectionStatus) {
-        jdbcTemplate.update(UPDATE_STATUS_SQL, servingState, collectionStatus, collectionId);
+        );
     }
 }

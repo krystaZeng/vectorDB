@@ -18,7 +18,10 @@ public interface RegisterVectorColumnUseCase {
             String vectorColumn,
             int dimension,
             String metricType,
-            String syncMode
+            String syncMode,
+            String status,
+            String definitionHash,
+            String remark
     ) {
     }
 }

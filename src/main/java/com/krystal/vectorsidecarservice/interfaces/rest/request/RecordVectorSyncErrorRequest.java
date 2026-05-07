@@ -14,7 +14,7 @@ public record RecordVectorSyncErrorRequest(
         @NotBlank String errorMessage,
         String payloadSnapshot,
         @NotBlank String dedupeKey,
-        Integer retryCount,
+        @Min(0) Integer retryCount,
         String nextRetryAt,
         String errorStatus
 ) {

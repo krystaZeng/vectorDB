@@ -1,9 +1,10 @@
 package com.krystal.vectorsidecarservice.application.registry;
 
 import com.krystal.vectorsidecarservice.application.port.in.RegisterVectorPayloadFieldUseCase;
+import com.krystal.vectorsidecarservice.application.port.out.IdGeneratorPort;
 import com.krystal.vectorsidecarservice.application.port.out.VectorPayloadFieldPort;
 import com.krystal.vectorsidecarservice.application.support.FieldValidator;
-import com.krystal.vectorsidecarservice.common.id.IdGenerator;
+import com.krystal.vectorsidecarservice.application.support.VectorMetadataReferenceGuard;
 import com.krystal.vectorsidecarservice.domain.registry.VectorPayloadFieldMeta;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
@@ -20,24 +21,35 @@ public class RegisterVectorPayloadFieldService implements RegisterVectorPayloadF
     private static final int MAX_PAYLOAD_INDEX_PARAMS_LEN = 2000;
 
     private final VectorPayloadFieldPort vectorPayloadFieldPort;
-    private final IdGenerator idGenerator;
+    private final IdGeneratorPort idGenerator;
+    private final VectorMetadataReferenceGuard referenceGuard;
 
     @Override
     public VectorPayloadFieldMeta register(RegisterVectorPayloadFieldCommand command) {
         FieldValidator.requirePositive(command.columnId(), "columnId");
+        String sourceColumnName = FieldValidator.requireText(command.sourceColumnName(), "sourceColumnName");
+        String payloadKey = FieldValidator.requireText(command.payloadKey(), "payloadKey");
+        String fieldType = FieldValidator.optionalText(command.fieldType(), "KEYWORD").toUpperCase(Locale.ROOT);
+        String isFilterable = FieldValidator.normalizeFlag(command.isFilterable(), "Y", "isFilterable");
+        String isReturnable = FieldValidator.normalizeFlag(command.isReturnable(), "Y", "isReturnable");
+        String isIndexed = FieldValidator.normalizeFlag(command.isIndexed(), "Y", "isIndexed");
+        String syncEnabled = FieldValidator.normalizeFlag(command.syncEnabled(), "Y", "syncEnabled");
+        String fieldStatus = FieldValidator.normalizeEnum(command.fieldStatus(), Set.of("ACTIVE", "DISABLED"), "ACTIVE", "fieldStatus");
+        String indexParamsJson = FieldValidator.optionalTextWithMaxLength(command.indexParamsJson(), "indexParamsJson", MAX_PAYLOAD_INDEX_PARAMS_LEN);
+        referenceGuard.requireColumnWritable(command.columnId());
         Instant now = Instant.now();
         VectorPayloadFieldMeta meta = new VectorPayloadFieldMeta(
                 idGenerator.nextId(),
                 command.columnId(),
-                FieldValidator.requireText(command.sourceColumnName(), "sourceColumnName"),
-                FieldValidator.requireText(command.payloadKey(), "payloadKey"),
-                FieldValidator.optionalText(command.fieldType(), "KEYWORD").toUpperCase(Locale.ROOT),
-                FieldValidator.normalizeFlag(command.isFilterable(), "Y", "isFilterable"),
-                FieldValidator.normalizeFlag(command.isReturnable(), "Y", "isReturnable"),
-                FieldValidator.normalizeFlag(command.isIndexed(), "Y", "isIndexed"),
-                FieldValidator.normalizeFlag(command.syncEnabled(), "Y", "syncEnabled"),
-                FieldValidator.normalizeEnum(command.fieldStatus(), Set.of("ACTIVE", "DISABLED"), "ACTIVE", "fieldStatus"),
-                FieldValidator.optionalTextWithMaxLength(command.indexParamsJson(), "indexParamsJson", MAX_PAYLOAD_INDEX_PARAMS_LEN),
+                sourceColumnName,
+                payloadKey,
+                fieldType,
+                isFilterable,
+                isReturnable,
+                isIndexed,
+                syncEnabled,
+                fieldStatus,
+                indexParamsJson,
                 now,
                 now
         );

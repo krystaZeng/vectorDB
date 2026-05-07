@@ -25,6 +25,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @Sql(statements = {
         "DROP TABLE IF EXISTS PUBLIC.DOC_STORE",
         "DROP TABLE IF EXISTS PUBLIC.DOC_STORE_AUTO",
+        "DROP TABLE IF EXISTS PUBLIC.DOC_STORE_CONFLICT",
         "DELETE FROM SYS_VECTOR_INDEXES_",
         "DELETE FROM SYS_VECTOR_COLLECTIONS_",
         "DELETE FROM SYS_VECTOR_COLUMNS_"
@@ -116,6 +117,8 @@ class VectorSchemaControllerIT {
                 .andExpect(jsonPath("$.data[0].vectorColumn").value("EMBEDDING"))
                 .andExpect(jsonPath("$.data[0].dimension").value(768))
                 .andExpect(jsonPath("$.data[0].metricType").value("COSINE"))
+                .andExpect(jsonPath("$.data[0].status").value("ACTIVE"))
+                .andExpect(jsonPath("$.data[0].definitionHash").isNotEmpty())
                 .andExpect(jsonPath("$.data[0].syncMode").value("FULL_AND_INCREMENTAL"));
     }
 
@@ -169,6 +172,13 @@ class VectorSchemaControllerIT {
         long collectionId = getDataLong(responseBody, "collectionId");
         long indexId = getDataLong(responseBody, "indexId");
 
+        String columnStatus = jdbcTemplate.queryForObject(
+                "SELECT STATUS FROM SYS_VECTOR_COLUMNS_ WHERE COLUMN_ID = ?",
+                String.class,
+                columnId
+        );
+        assertThat(columnStatus).isEqualTo("BUILDING");
+
         mockMvc.perform(get("/api/v1/vector-collections").param("columnId", String.valueOf(columnId)))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true))
@@ -187,6 +197,55 @@ class VectorSchemaControllerIT {
                 .andExpect(jsonPath("$.data[0].metricType").value("COSINE"))
                 .andExpect(jsonPath("$.data[0].servingState").value("OFFLINE"))
                 .andExpect(jsonPath("$.data[0].indexStatus").value("CREATING"));
+
+        String retryPayload = payload.replace("\"ifNotExists\": true", "\"ifNotExists\": false");
+        mockMvc.perform(post("/api/v1/vector-schemas/tables")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(retryPayload))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.ddlExecuted").value(false))
+                .andExpect(jsonPath("$.data.collectionId").value(collectionId))
+                .andExpect(jsonPath("$.data.indexId").value(indexId));
+    }
+
+    @Test
+    void shouldRejectCreateTableWhenDefinitionHashConflicts() throws Exception {
+        String payload = """
+                {
+                  "tenantId": "tenant_conflict",
+                  "schemaName": "public",
+                  "tableName": "doc_store_conflict",
+                  "ifNotExists": true,
+                  "primaryKey": {
+                    "name": "id",
+                    "type": "bigint"
+                  },
+                  "vectorColumn": {
+                    "name": "embedding",
+                    "dimension": 768,
+                    "elementType": "float32",
+                    "metricType": "cosine",
+                    "syncMode": "full_and_incremental"
+                  }
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/vector-schemas/tables")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(payload))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+
+        String conflictingPayload = payload.replace("\"dimension\": 768", "\"dimension\": 1536");
+        mockMvc.perform(post("/api/v1/vector-schemas/tables")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(conflictingPayload))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.containsString(
+                        "vector column definition conflicts with existing metadata"
+                )));
     }
 
     private long getDataLong(String body, String field) {

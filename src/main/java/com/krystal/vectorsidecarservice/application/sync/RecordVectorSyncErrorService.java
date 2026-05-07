@@ -1,10 +1,11 @@
 package com.krystal.vectorsidecarservice.application.sync;
 
 import com.krystal.vectorsidecarservice.application.port.in.RecordVectorSyncErrorUseCase;
+import com.krystal.vectorsidecarservice.application.port.out.IdGeneratorPort;
 import com.krystal.vectorsidecarservice.application.port.out.VectorSyncErrorPort;
 import com.krystal.vectorsidecarservice.application.support.FieldValidator;
+import com.krystal.vectorsidecarservice.application.support.VectorMetadataReferenceGuard;
 import com.krystal.vectorsidecarservice.common.exception.BizException;
-import com.krystal.vectorsidecarservice.common.id.IdGenerator;
 import com.krystal.vectorsidecarservice.domain.sync.VectorSyncErrorMeta;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
@@ -21,7 +22,8 @@ public class RecordVectorSyncErrorService implements RecordVectorSyncErrorUseCas
     private static final int MAX_PAYLOAD_SNAPSHOT_LEN = 2000;
 
     private final VectorSyncErrorPort vectorSyncErrorPort;
-    private final IdGenerator idGenerator;
+    private final IdGeneratorPort idGenerator;
+    private final VectorMetadataReferenceGuard referenceGuard;
 
     @Override
     public VectorSyncErrorMeta record(RecordVectorSyncErrorCommand command) {
@@ -38,6 +40,8 @@ public class RecordVectorSyncErrorService implements RecordVectorSyncErrorUseCas
         if (!"RETRYING".equals(errorStatus) && nextRetryAt != null) {
             throw new BizException("nextRetryAt is only allowed when errorStatus=RETRYING");
         }
+        int retryCount = FieldValidator.nonNegativeOrDefault(command.retryCount(), 0, "retryCount");
+        referenceGuard.requireSyncJobForColumn(command.jobId(), command.columnId());
         VectorSyncErrorMeta meta = new VectorSyncErrorMeta(
                 idGenerator.nextId(),
                 command.jobId(),
@@ -52,7 +56,7 @@ public class RecordVectorSyncErrorService implements RecordVectorSyncErrorUseCas
                 FieldValidator.requireText(command.dedupeKey(), "dedupeKey"),
                 now,
                 now,
-                command.retryCount() == null ? 0 : command.retryCount(),
+                retryCount,
                 nextRetryAt,
                 errorStatus,
                 now,

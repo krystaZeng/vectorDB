@@ -15,6 +15,8 @@ public record VectorColumnResponse(
         String metricType,
         String status,
         String syncMode,
+        String definitionHash,
+        String remark,
         Instant createdAt,
         Instant updatedAt
 ) {
@@ -30,6 +32,8 @@ public record VectorColumnResponse(
                 meta.metricType(),
                 meta.status(),
                 meta.syncMode(),
+                meta.definitionHash(),
+                meta.remark(),
                 meta.createdAt(),
                 meta.updatedAt()
         );

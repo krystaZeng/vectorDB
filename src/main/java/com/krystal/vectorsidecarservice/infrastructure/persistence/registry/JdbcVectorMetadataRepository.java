@@ -8,8 +8,11 @@ import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
 
+import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.util.List;
+import java.util.Optional;
 
 @Repository
 @RequiredArgsConstructor
@@ -30,9 +33,11 @@ public class JdbcVectorMetadataRepository implements VectorMetadataPort {
                 DELETE_POLICY,
                 STATUS,
                 SYNC_MODE,
+                DEFINITION_HASH,
+                REMARK,
                 CREATED_AT,
                 UPDATED_AT
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """;
 
     private static final String FIND_ALL_SQL = """
@@ -47,10 +52,61 @@ public class JdbcVectorMetadataRepository implements VectorMetadataPort {
                 METRIC_TYPE,
                 STATUS,
                 SYNC_MODE,
+                DEFINITION_HASH,
+                REMARK,
                 CREATED_AT,
                 UPDATED_AT
             FROM SYS_VECTOR_COLUMNS_
             ORDER BY CREATED_AT DESC
+            """;
+
+    private static final String FIND_BY_IDENTITY_SQL = """
+            SELECT
+                COLUMN_ID,
+                TENANT_ID,
+                SCHEMA_NAME,
+                TABLE_NAME,
+                COLUMN_NAME,
+                PK_COLUMN_NAME,
+                VECTOR_DIM,
+                METRIC_TYPE,
+                STATUS,
+                SYNC_MODE,
+                DEFINITION_HASH,
+                REMARK,
+                CREATED_AT,
+                UPDATED_AT
+            FROM SYS_VECTOR_COLUMNS_
+            WHERE TENANT_ID = ?
+              AND SCHEMA_NAME = ?
+              AND TABLE_NAME = ?
+              AND COLUMN_NAME = ?
+            """;
+
+    private static final String FIND_BY_ID_SQL = """
+            SELECT
+                COLUMN_ID,
+                TENANT_ID,
+                SCHEMA_NAME,
+                TABLE_NAME,
+                COLUMN_NAME,
+                PK_COLUMN_NAME,
+                VECTOR_DIM,
+                METRIC_TYPE,
+                STATUS,
+                SYNC_MODE,
+                DEFINITION_HASH,
+                REMARK,
+                CREATED_AT,
+                UPDATED_AT
+            FROM SYS_VECTOR_COLUMNS_
+            WHERE COLUMN_ID = ?
+            """;
+
+    private static final String UPDATE_STATUS_SQL = """
+            UPDATE SYS_VECTOR_COLUMNS_
+            SET STATUS = ?, REMARK = ?, UPDATED_AT = CURRENT_TIMESTAMP
+            WHERE COLUMN_ID = ?
             """;
 
     private final JdbcTemplate jdbcTemplate;
@@ -73,6 +129,8 @@ public class JdbcVectorMetadataRepository implements VectorMetadataPort {
                     "SOFT",
                     meta.status(),
                     meta.syncMode(),
+                    meta.definitionHash(),
+                    meta.remark(),
                     Timestamp.from(meta.createdAt()),
                     Timestamp.from(meta.updatedAt())
             );
@@ -83,23 +141,50 @@ public class JdbcVectorMetadataRepository implements VectorMetadataPort {
     }
 
     @Override
+    public Optional<VectorColumnMeta> findById(long columnId) {
+        return jdbcTemplate.query(FIND_BY_ID_SQL, this::mapRow, columnId)
+                .stream()
+                .findFirst();
+    }
+
+    @Override
+    public Optional<VectorColumnMeta> findByIdentity(
+            String tenantId,
+            String schemaName,
+            String tableName,
+            String vectorColumn
+    ) {
+        return jdbcTemplate.query(FIND_BY_IDENTITY_SQL, this::mapRow, tenantId, schemaName, tableName, vectorColumn)
+                .stream()
+                .findFirst();
+    }
+
+    @Override
     public List<VectorColumnMeta> findAll() {
-        return jdbcTemplate.query(
-                FIND_ALL_SQL,
-                (rs, rowNum) -> new VectorColumnMeta(
-                        rs.getLong("COLUMN_ID"),
-                        rs.getString("TENANT_ID"),
-                        rs.getString("SCHEMA_NAME"),
-                        rs.getString("TABLE_NAME"),
-                        rs.getString("PK_COLUMN_NAME"),
-                        rs.getString("COLUMN_NAME"),
-                        rs.getInt("VECTOR_DIM"),
-                        rs.getString("METRIC_TYPE"),
-                        rs.getString("STATUS"),
-                        rs.getString("SYNC_MODE"),
-                        rs.getTimestamp("CREATED_AT").toInstant(),
-                        rs.getTimestamp("UPDATED_AT").toInstant()
-                )
+        return jdbcTemplate.query(FIND_ALL_SQL, this::mapRow);
+    }
+
+    @Override
+    public void updateStatus(long columnId, String status, String remark) {
+        jdbcTemplate.update(UPDATE_STATUS_SQL, status, remark, columnId);
+    }
+
+    private VectorColumnMeta mapRow(ResultSet rs, int rowNum) throws SQLException {
+        return new VectorColumnMeta(
+                rs.getLong("COLUMN_ID"),
+                rs.getString("TENANT_ID"),
+                rs.getString("SCHEMA_NAME"),
+                rs.getString("TABLE_NAME"),
+                rs.getString("PK_COLUMN_NAME"),
+                rs.getString("COLUMN_NAME"),
+                rs.getInt("VECTOR_DIM"),
+                rs.getString("METRIC_TYPE"),
+                rs.getString("STATUS"),
+                rs.getString("SYNC_MODE"),
+                rs.getString("DEFINITION_HASH"),
+                rs.getString("REMARK"),
+                rs.getTimestamp("CREATED_AT").toInstant(),
+                rs.getTimestamp("UPDATED_AT").toInstant()
         );
     }
 }

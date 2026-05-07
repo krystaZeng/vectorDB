@@ -1,6 +1,7 @@
 package com.krystal.vectorsidecarservice;
 
 import com.krystal.vectorsidecarservice.application.port.in.RegisterVectorColumnUseCase;
+import com.krystal.vectorsidecarservice.application.port.in.RegisterVectorCollectionUseCase;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -38,6 +39,9 @@ class VectorSystemControllerIT {
     @Autowired
     private RegisterVectorColumnUseCase registerVectorColumnUseCase;
 
+    @Autowired
+    private RegisterVectorCollectionUseCase registerVectorCollectionUseCase;
+
     @Test
     void shouldManageSystemTablesViaApis() throws Exception {
         var column = registerVectorColumnUseCase.register(
@@ -49,7 +53,10 @@ class VectorSystemControllerIT {
                         "embedding",
                         768,
                         "cosine",
-                        "full_and_incremental"
+                        "full_and_incremental",
+                        null,
+                        null,
+                        null
                 )
         );
 
@@ -220,6 +227,53 @@ class VectorSystemControllerIT {
                 .andExpect(jsonPath("$.data.length()").value(1));
     }
 
+    @Test
+    void shouldRejectNegativeSyncProgressCountersViaApi() throws Exception {
+        String payload = """
+                {
+                  "jobId": 1,
+                  "columnId": 1,
+                  "partitionId": "p0",
+                  "processedRows": -1,
+                  "successRows": 0,
+                  "failedRows": 0,
+                  "progressStatus": "RUNNING"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/vector-sync-progress")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(payload))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.containsString("processedRows")));
+    }
+
+    @Test
+    void shouldRejectNegativeSyncErrorRetryCountViaApi() throws Exception {
+        String payload = """
+                {
+                  "jobId": 1,
+                  "columnId": 1,
+                  "sourcePk": "100",
+                  "opType": "UPSERT",
+                  "errorStage": "UPSERT",
+                  "errorCode": "QDRANT_TIMEOUT",
+                  "errorMessage": "upsert timed out",
+                  "dedupeKey": "negative-retry-count",
+                  "retryCount": -1,
+                  "errorStatus": "OPEN"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/vector-sync-errors")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(payload))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.containsString("retryCount")));
+    }
+
     private long getDataLong(String body, String field) throws Exception {
         Pattern pattern = Pattern.compile("\"" + Pattern.quote(field) + "\"\\s*:\\s*(\\d+)");
         Matcher matcher = pattern.matcher(body);
@@ -227,5 +281,114 @@ class VectorSystemControllerIT {
             throw new IllegalStateException("Cannot find numeric field in response: " + field);
         }
         return Long.parseLong(matcher.group(1));
+    }
+
+    @Test
+    void shouldRejectInvalidCollectionLifecycleCombination() throws Exception {
+        var column = registerVectorColumnUseCase.register(
+                new RegisterVectorColumnUseCase.RegisterVectorColumnCommand(
+                        "tenant_lifecycle",
+                        "public",
+                        "doc_lifecycle",
+                        "id",
+                        "embedding",
+                        768,
+                        "cosine",
+                        "full_and_incremental",
+                        null,
+                        null,
+                        null
+                )
+        );
+
+        String payload = """
+                {
+                  "columnId": %d,
+                  "namespaceName": "tenant_lifecycle",
+                  "collectionName": "doc_lifecycle_embeddings_v1",
+                  "collectionVersion": "v1",
+                  "qdrantVectorName": "default",
+                  "vectorDim": 768,
+                  "distanceMetric": "cosine",
+                  "qdrantIdType": "uint64",
+                  "servingState": "ACTIVE",
+                  "collectionStatus": "FAILED",
+                  "onDiskPayload": "N"
+                }
+                """.formatted(column.columnId());
+
+        mockMvc.perform(post("/api/v1/vector-collections")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(payload))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.message").value(
+                        "collection lifecycle has invalid state combination: servingState=ACTIVE, collectionStatus=FAILED"
+                ));
+    }
+
+    @Test
+    void shouldRejectInvalidIndexLifecycleCombination() throws Exception {
+        var column = registerVectorColumnUseCase.register(
+                new RegisterVectorColumnUseCase.RegisterVectorColumnCommand(
+                        "tenant_index_lifecycle",
+                        "public",
+                        "doc_index_lifecycle",
+                        "id",
+                        "embedding",
+                        768,
+                        "cosine",
+                        "full_and_incremental",
+                        null,
+                        null,
+                        null
+                )
+        );
+        var collection = registerVectorCollectionUseCase.register(
+                new RegisterVectorCollectionUseCase.RegisterVectorCollectionCommand(
+                        column.columnId(),
+                        "QDRANT",
+                        "tenant_index_lifecycle",
+                        "doc_index_lifecycle_embeddings_v1",
+                        "doc_index_lifecycle_embeddings_active",
+                        "v1",
+                        "default",
+                        768,
+                        "cosine",
+                        "uint64",
+                        "ACTIVE",
+                        "READY",
+                        null,
+                        null,
+                        null,
+                        "N",
+                        null,
+                        null,
+                        null
+                )
+        );
+
+        String payload = """
+                {
+                  "columnId": %d,
+                  "collectionId": %d,
+                  "profileName": "invalid_lifecycle_profile",
+                  "indexType": "HNSW",
+                  "metricType": "COSINE",
+                  "isDefault": "Y",
+                  "servingState": "ONLINE",
+                  "indexStatus": "CREATING",
+                  "buildVersion": "v1"
+                }
+                """.formatted(column.columnId(), collection.collectionId());
+
+        mockMvc.perform(post("/api/v1/vector-indexes")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(payload))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.message").value(
+                        "index lifecycle has invalid state combination: servingState=ONLINE, indexStatus=CREATING"
+                ));
     }
 }

@@ -44,16 +44,17 @@ class VectorRegistryControllerIT {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true))
                 .andExpect(jsonPath("$.data.tenantId").value("TENANT_A"))
-                .andExpect(jsonPath("$.data.tableName").value("doc"))
+                .andExpect(jsonPath("$.data.tableName").value("DOC"))
                 .andExpect(jsonPath("$.data.metricType").value("COSINE"))
                 .andExpect(jsonPath("$.data.status").value("ACTIVE"))
-                .andExpect(jsonPath("$.data.syncMode").value("FULL_AND_INCREMENTAL"));
+                .andExpect(jsonPath("$.data.syncMode").value("FULL_AND_INCREMENTAL"))
+                .andExpect(jsonPath("$.data.definitionHash").isNotEmpty());
 
         mockMvc.perform(get("/api/v1/vector-columns"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true))
-                .andExpect(jsonPath("$.data[0].tableName").value("doc"))
-                .andExpect(jsonPath("$.data[0].vectorColumn").value("embedding"));
+                .andExpect(jsonPath("$.data[0].tableName").value("DOC"))
+                .andExpect(jsonPath("$.data[0].vectorColumn").value("EMBEDDING"));
     }
 
     @Test

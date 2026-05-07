@@ -13,6 +13,8 @@ public record VectorColumnMeta(
         String metricType,
         String status,
         String syncMode,
+        String definitionHash,
+        String remark,
         Instant createdAt,
         Instant updatedAt
 ) {

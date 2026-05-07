@@ -1,9 +1,10 @@
 package com.krystal.vectorsidecarservice.application.sync;
 
 import com.krystal.vectorsidecarservice.application.port.in.CreateVectorSyncJobUseCase;
+import com.krystal.vectorsidecarservice.application.port.out.IdGeneratorPort;
 import com.krystal.vectorsidecarservice.application.port.out.VectorSyncJobPort;
 import com.krystal.vectorsidecarservice.application.support.FieldValidator;
-import com.krystal.vectorsidecarservice.common.id.IdGenerator;
+import com.krystal.vectorsidecarservice.application.support.VectorServingReadinessGuard;
 import com.krystal.vectorsidecarservice.domain.sync.VectorSyncJobMeta;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
@@ -17,17 +18,21 @@ import java.util.Set;
 public class CreateVectorSyncJobService implements CreateVectorSyncJobUseCase {
 
     private final VectorSyncJobPort vectorSyncJobPort;
-    private final IdGenerator idGenerator;
+    private final IdGeneratorPort idGenerator;
+    private final VectorServingReadinessGuard readinessGuard;
 
     @Override
     public VectorSyncJobMeta create(CreateVectorSyncJobCommand command) {
         FieldValidator.requirePositive(command.columnId(), "columnId");
+        Long collectionId = FieldValidator.optionalPositive(command.collectionId(), "collectionId");
+        Long indexId = FieldValidator.optionalPositive(command.indexId(), "indexId");
+        readinessGuard.requireReadyForSync(command.columnId(), collectionId, indexId);
         Instant now = Instant.now();
         VectorSyncJobMeta meta = new VectorSyncJobMeta(
                 idGenerator.nextId(),
                 command.columnId(),
-                command.collectionId(),
-                command.indexId(),
+                collectionId,
+                indexId,
                 FieldValidator.normalizeEnum(command.jobType(), Set.of("BACKFILL", "CDC", "REBUILD", "REPAIR"), "BACKFILL", "jobType"),
                 "PENDING",
                 FieldValidator.normalizeEnum(command.triggerType(), Set.of("MANUAL", "SCHEDULED", "SYSTEM"), "MANUAL", "triggerType"),
