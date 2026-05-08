@@ -18,10 +18,39 @@ public interface RegisterVectorColumnUseCase {
             String vectorColumn,
             int dimension,
             String metricType,
+            String vectorEncoding,
             String syncMode,
             String status,
             String definitionHash,
             String remark
     ) {
+        public RegisterVectorColumnCommand(
+                String tenantId,
+                String schemaName,
+                String tableName,
+                String pkColumn,
+                String vectorColumn,
+                int dimension,
+                String metricType,
+                String syncMode,
+                String status,
+                String definitionHash,
+                String remark
+        ) {
+            this(
+                    tenantId,
+                    schemaName,
+                    tableName,
+                    pkColumn,
+                    vectorColumn,
+                    dimension,
+                    metricType,
+                    null,
+                    syncMode,
+                    status,
+                    definitionHash,
+                    remark
+            );
+        }
     }
 }

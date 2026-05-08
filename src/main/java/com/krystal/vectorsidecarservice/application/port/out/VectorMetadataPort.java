@@ -13,6 +13,8 @@ public interface VectorMetadataPort {
 
     Optional<VectorColumnMeta> findByIdentity(String tenantId, String schemaName, String tableName, String vectorColumn);
 
+    List<VectorColumnMeta> findByTableIdentity(String tenantId, String schemaName, String tableName);
+
     List<VectorColumnMeta> findAll();
 
     void updateStatus(long columnId, String status, String remark);

@@ -32,6 +32,7 @@ public class VectorRegistryController {
                         request.vectorColumn(),
                         request.dimension(),
                         request.metricType(),
+                        request.vectorEncoding(),
                         request.syncMode(),
                         null,
                         null,

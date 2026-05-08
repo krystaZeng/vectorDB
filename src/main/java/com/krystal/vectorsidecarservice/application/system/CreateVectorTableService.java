@@ -340,6 +340,7 @@ public class CreateVectorTableService implements CreateVectorTableUseCase {
                         vectorColumn.name(),
                         vectorColumn.dimension(),
                         vectorColumn.metricType(),
+                        vectorEncoding(vectorColumn.elementType()),
                         vectorColumn.syncMode(),
                         VectorColumnLifecycle.BUILDING.status(),
                         definitionHash,
@@ -686,6 +687,15 @@ public class CreateVectorTableService implements CreateVectorTableUseCase {
 
     private String vectorStorageType(RelationalSchemaPort.DatabaseDialect dialect) {
         return dialect == RelationalSchemaPort.DatabaseDialect.ALTIBASE ? "VARBYTE" : "VARBINARY";
+    }
+
+    private String vectorEncoding(String elementType) {
+        return switch (elementType.toUpperCase(Locale.ROOT)) {
+            case "FLOAT32" -> "FLOAT32_LE";
+            case "FLOAT16" -> "FLOAT16_LE";
+            case "INT8" -> "INT8";
+            default -> throw new BizException("vectorColumn.elementType must be one of FLOAT32, FLOAT16, INT8");
+        };
     }
 
     private int vectorStorageLength(VectorColumnSpec vectorColumn) {

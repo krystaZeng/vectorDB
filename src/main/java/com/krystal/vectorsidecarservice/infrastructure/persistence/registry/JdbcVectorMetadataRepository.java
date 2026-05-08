@@ -50,6 +50,7 @@ public class JdbcVectorMetadataRepository implements VectorMetadataPort {
                 PK_COLUMN_NAME,
                 VECTOR_DIM,
                 METRIC_TYPE,
+                VECTOR_ENCODING,
                 STATUS,
                 SYNC_MODE,
                 DEFINITION_HASH,
@@ -70,6 +71,7 @@ public class JdbcVectorMetadataRepository implements VectorMetadataPort {
                 PK_COLUMN_NAME,
                 VECTOR_DIM,
                 METRIC_TYPE,
+                VECTOR_ENCODING,
                 STATUS,
                 SYNC_MODE,
                 DEFINITION_HASH,
@@ -93,6 +95,7 @@ public class JdbcVectorMetadataRepository implements VectorMetadataPort {
                 PK_COLUMN_NAME,
                 VECTOR_DIM,
                 METRIC_TYPE,
+                VECTOR_ENCODING,
                 STATUS,
                 SYNC_MODE,
                 DEFINITION_HASH,
@@ -101,6 +104,30 @@ public class JdbcVectorMetadataRepository implements VectorMetadataPort {
                 UPDATED_AT
             FROM SYS_VECTOR_COLUMNS_
             WHERE COLUMN_ID = ?
+            """;
+
+    private static final String FIND_BY_TABLE_IDENTITY_SQL = """
+            SELECT
+                COLUMN_ID,
+                TENANT_ID,
+                SCHEMA_NAME,
+                TABLE_NAME,
+                COLUMN_NAME,
+                PK_COLUMN_NAME,
+                VECTOR_DIM,
+                METRIC_TYPE,
+                VECTOR_ENCODING,
+                STATUS,
+                SYNC_MODE,
+                DEFINITION_HASH,
+                REMARK,
+                CREATED_AT,
+                UPDATED_AT
+            FROM SYS_VECTOR_COLUMNS_
+            WHERE TENANT_ID = ?
+              AND SCHEMA_NAME = ?
+              AND TABLE_NAME = ?
+            ORDER BY COLUMN_NAME
             """;
 
     private static final String UPDATE_STATUS_SQL = """
@@ -124,7 +151,7 @@ public class JdbcVectorMetadataRepository implements VectorMetadataPort {
                     meta.pkColumn(),
                     meta.dimension(),
                     meta.metricType(),
-                    "FLOAT32_LE",
+                    meta.vectorEncoding(),
                     "DIRECT",
                     "SOFT",
                     meta.status(),
@@ -165,6 +192,11 @@ public class JdbcVectorMetadataRepository implements VectorMetadataPort {
     }
 
     @Override
+    public List<VectorColumnMeta> findByTableIdentity(String tenantId, String schemaName, String tableName) {
+        return jdbcTemplate.query(FIND_BY_TABLE_IDENTITY_SQL, this::mapRow, tenantId, schemaName, tableName);
+    }
+
+    @Override
     public void updateStatus(long columnId, String status, String remark) {
         jdbcTemplate.update(UPDATE_STATUS_SQL, status, remark, columnId);
     }
@@ -179,6 +211,7 @@ public class JdbcVectorMetadataRepository implements VectorMetadataPort {
                 rs.getString("COLUMN_NAME"),
                 rs.getInt("VECTOR_DIM"),
                 rs.getString("METRIC_TYPE"),
+                rs.getString("VECTOR_ENCODING"),
                 rs.getString("STATUS"),
                 rs.getString("SYNC_MODE"),
                 rs.getString("DEFINITION_HASH"),

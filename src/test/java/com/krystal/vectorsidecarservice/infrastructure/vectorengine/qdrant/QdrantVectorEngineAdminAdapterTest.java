@@ -1,6 +1,7 @@
 package com.krystal.vectorsidecarservice.infrastructure.vectorengine.qdrant;
 
 import com.krystal.vectorsidecarservice.application.port.out.VectorEngineAdminPort;
+import com.krystal.vectorsidecarservice.application.port.out.VectorEngineDataPort;
 import com.krystal.vectorsidecarservice.common.exception.BizException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -10,6 +11,9 @@ import org.springframework.http.MediaType;
 import org.springframework.test.web.client.MockRestServiceServer;
 import org.springframework.web.client.RestClient;
 import tools.jackson.databind.ObjectMapper;
+
+import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -97,6 +101,29 @@ class QdrantVectorEngineAdminAdapterTest {
         ))
                 .isInstanceOf(BizException.class)
                 .hasMessage("qdrant alias doc_active already points to doc_v0, expected doc_v1");
+        server.verify();
+    }
+
+    @Test
+    void shouldUpsertPointWithPayload() {
+        server.expect(requestTo("http://qdrant.test/collections/doc_active/points?wait=true"))
+                .andExpect(method(HttpMethod.PUT))
+                .andExpect(content().string(containsString("\"id\":123")))
+                .andExpect(content().string(containsString("\"vector\"")))
+                .andExpect(content().string(containsString("\"docType\":\"news\"")))
+                .andRespond(withSuccess("{\"status\":\"ok\",\"result\":{\"operation_id\":1}}", MediaType.APPLICATION_JSON));
+
+        VectorEngineDataPort.UpsertPointResult result = adapter().upsertPoint(
+                new VectorEngineDataPort.UpsertPointCommand(
+                        "doc_active",
+                        "default",
+                        123L,
+                        List.of(0.1f, 0.2f, 0.3f),
+                        Map.of("docType", "news")
+                )
+        );
+
+        assertThat(result.status()).isEqualTo(VectorEngineDataPort.UpsertPointStatus.UPSERTED);
         server.verify();
     }
 

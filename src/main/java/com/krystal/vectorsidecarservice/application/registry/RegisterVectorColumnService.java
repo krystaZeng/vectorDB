@@ -24,6 +24,7 @@ public class RegisterVectorColumnService implements RegisterVectorColumnUseCase 
     private static final String DEFAULT_TENANT = "DEFAULT";
     private static final String DEFAULT_SCHEMA = "PUBLIC";
     private static final String DEFAULT_METRIC_TYPE = "COSINE";
+    private static final String DEFAULT_VECTOR_ENCODING = "FLOAT32_LE";
     private static final String DEFAULT_SYNC_MODE = "FULL_AND_INCREMENTAL";
     private static final String DEFAULT_STATUS = "ACTIVE";
     private static final int MAX_REMARK_LEN = 1024;
@@ -37,6 +38,7 @@ public class RegisterVectorColumnService implements RegisterVectorColumnUseCase 
             throw new BizException("dimension must be greater than 0");
         }
         String metricType = normalizeMetricType(command.metricType());
+        String vectorEncoding = normalizeVectorEncoding(command.vectorEncoding());
         String syncMode = normalizeSyncMode(command.syncMode());
         String tenantId = normalizeWithDefault(command.tenantId(), DEFAULT_TENANT);
         String schemaName = normalizeWithDefault(command.schemaName(), DEFAULT_SCHEMA);
@@ -45,7 +47,7 @@ public class RegisterVectorColumnService implements RegisterVectorColumnUseCase 
         String vectorColumn = trimRequired(command.vectorColumn(), "vectorColumn").toUpperCase(Locale.ROOT);
         String status = normalizeStatus(command.status());
         String definitionHash = normalizeDefinitionHash(command.definitionHash(), tenantId, schemaName, tableName,
-                pkColumn, vectorColumn, command.dimension(), metricType, syncMode);
+                pkColumn, vectorColumn, command.dimension(), metricType, vectorEncoding, syncMode);
         Instant now = Instant.now();
 
         VectorColumnMeta meta = new VectorColumnMeta(
@@ -57,6 +59,7 @@ public class RegisterVectorColumnService implements RegisterVectorColumnUseCase 
                 vectorColumn,
                 command.dimension(),
                 metricType,
+                vectorEncoding,
                 status,
                 syncMode,
                 definitionHash,
@@ -95,6 +98,14 @@ public class RegisterVectorColumnService implements RegisterVectorColumnUseCase 
         return normalized;
     }
 
+    private String normalizeVectorEncoding(String vectorEncoding) {
+        String normalized = normalizeWithDefault(vectorEncoding, DEFAULT_VECTOR_ENCODING);
+        if (!normalized.equals("FLOAT32_LE") && !normalized.equals("FLOAT16_LE") && !normalized.equals("INT8")) {
+            throw new BizException("vectorEncoding must be one of FLOAT32_LE, FLOAT16_LE, INT8");
+        }
+        return normalized;
+    }
+
     private String normalizeStatus(String status) {
         String normalized = normalizeWithDefault(status, DEFAULT_STATUS);
         return VectorColumnLifecycle.normalize(normalized).status();
@@ -109,6 +120,7 @@ public class RegisterVectorColumnService implements RegisterVectorColumnUseCase 
             String vectorColumn,
             int dimension,
             String metricType,
+            String vectorEncoding,
             String syncMode
     ) {
         if (value != null && !value.isBlank()) {
@@ -122,6 +134,7 @@ public class RegisterVectorColumnService implements RegisterVectorColumnUseCase 
                 vectorColumn,
                 String.valueOf(dimension),
                 metricType,
+                vectorEncoding,
                 syncMode
         );
         return sha256(canonical);

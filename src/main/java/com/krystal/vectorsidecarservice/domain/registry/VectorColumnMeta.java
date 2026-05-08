@@ -11,6 +11,7 @@ public record VectorColumnMeta(
         String vectorColumn,
         int dimension,
         String metricType,
+        String vectorEncoding,
         String status,
         String syncMode,
         String definitionHash,

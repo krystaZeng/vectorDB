@@ -2,7 +2,7 @@
 
 Altibase + Qdrant 旁路架构的向量控制面 Sidecar。
 
-本服务负责管理向量列元数据、Qdrant collection/index 元数据、同步任务进度与错误记录，并在需要时编排关系表建表和 Qdrant 物理资源创建。当前不负责 embedding 生成，也不承担在线向量检索流量。
+本服务负责管理向量列元数据、Qdrant collection/index 元数据、同步任务进度与错误记录，并在需要时编排关系表建表、Qdrant 物理资源创建和同步式向量数据写入。当前不负责 embedding 生成，也不承担在线向量检索流量。
 
 架构分层与目录约束见：[ARCHITECTURE.md](ARCHITECTURE.md)
 
@@ -55,6 +55,21 @@ Sync 负责同步任务运行态：
 - `domain/sync`
 - `application/sync`
 - `infrastructure/persistence/sync`
+
+### Data：定义“写入哪一行/哪个 point”
+
+Data 负责同步式数据写入：
+
+- 通过业务身份 `tenantId + schemaName + tableName + vectorColumn` 定位内部 `columnId`
+- 校验 `column=ACTIVE`、`collection=ACTIVE/READY`
+- 将向量按 `VECTOR_ENCODING` 编码为关系表中的 `VARBYTE/VARBINARY`
+- 将同一向量 upsert 到 Qdrant points
+- payload 只接受已注册且 ACTIVE 的 payload key，并通过 `SOURCE_COLUMN_NAME` 写入关系表标量列
+
+相关目录：
+
+- `application/data`
+- `infrastructure/persistence/data`
 
 ### System：跨表编排
 
@@ -140,6 +155,7 @@ collection/index 的状态不应在业务代码中到处传裸字符串。当前
 
 当前打通的一条垂直链路：
 
+- `POST /api/v1/vector-tables` 简化建表接口，面向业务调用方；默认注册 Qdrant collection/index，并可在 scalar column 上声明 payload key
 - `POST /api/v1/vector-schemas/tables` 结构化建表（Altibase/H2）并自动注册向量列（可选自动注册默认 collection/index）
 - `POST /api/v1/vector-columns` 注册向量列元数据（落表 `SYS_VECTOR_COLUMNS_`）
 - `GET /api/v1/vector-columns` 查询已注册元数据
@@ -149,9 +165,33 @@ collection/index 的状态不应在业务代码中到处传裸字符串。当前
 - `POST/GET /api/v1/vector-sync-jobs` 管理 `SYS_VECTOR_SYNC_JOBS_`
 - `POST/GET /api/v1/vector-sync-progress` 管理 `SYS_VECTOR_SYNC_PROGRESS_`
 - `POST/GET /api/v1/vector-sync-errors` 管理 `SYS_VECTOR_SYNC_ERRORS_`
+- `POST /api/v1/vector-data/insert` 同步写入关系表；有 vector 时同时 upsert Qdrant point
+
+## API 使用建议
+
+面向业务调用方，优先使用简化接口：
+
+- 建表：`POST /api/v1/vector-tables`
+- 写入：`POST /api/v1/vector-data/insert`
+
+`/api/v1/vector-tables` 会隐藏控制面默认值：
+
+- `engineType=QDRANT`
+- `ifNotExists=true`
+- `autoRegisterCollection=true`
+- `autoRegisterIndex=true`
+- `defaultIndexProfileName=default`
+- `elementType=FLOAT32`
+- `metricType=COSINE`
+- `syncMode=FULL_AND_INCREMENTAL`
+
+scalar column 可以声明 `payloadKey`。声明后服务会自动注册 `SYS_VECTOR_PAYLOAD_FIELDS_`，后续 insert 请求里的 `payload` 就可以使用这个 key。`payloadSyncEnabled=false` 表示该字段只写关系表，不同步到 Qdrant payload。
+
+`/api/v1/vector-schemas/tables`、`/api/v1/vector-columns`、`/api/v1/vector-collections`、`/api/v1/vector-indexes`、`/api/v1/vector-payload-fields` 保留为高级/控制面接口，用于自定义 engine、index profile、手工注册或排障修复，不建议普通业务链路直接依赖这些细粒度接口。
 
 ## Create Table 执行边界
 
+- `POST /api/v1/vector-tables` 是推荐业务入口，本质上复用结构化建表编排，并自动补齐默认 collection/index/payload metadata。
 - `POST /api/v1/vector-schemas/tables` 会在关系库中执行真实 `CREATE TABLE`（通过 JDBC）
 - 不是仅注册系统表；返回里 `ddlExecuted=true/false` 用于表示是否真的执行了 DDL
 - 当 `ifNotExists=true` 且表已存在时，不再执行 DDL（`ddlExecuted=false`）
@@ -165,6 +205,20 @@ collection/index 的状态不应在业务代码中到处传裸字符串。当前
   - `FLOAT16 -> 2` 字节
   - `INT8 -> 1` 字节
 - 若同时开启 `autoRegisterCollection` + `autoRegisterIndex`，会继续注册系统表并调用 Qdrant 创建物理资源
+
+## Insert 执行边界
+
+- `POST /api/v1/vector-data/insert` 对外不要求传 `columnId`。若传 `vectorColumn`，使用 `tenantId + schemaName + tableName + vectorColumn` 解析内部元数据；若不传 `vectorColumn`，表下必须只有一个已注册向量列。
+- insert 支持三种形态：
+  - 纯标量：不传 `vector`，只写关系表，不要求 READY collection，不调用 Qdrant。
+  - 纯向量：传 `pk + vector`，写关系表向量列，并 upsert Qdrant point。
+  - 标量 + 向量：传 `pk + vector + payload`，写关系表并 upsert Qdrant point/payload。
+- 有 `vector` 时只消费严格可用资源：`SYS_VECTOR_COLUMNS_.STATUS=ACTIVE`，且存在 `SERVING_STATE=ACTIVE / COLLECTION_STATUS=READY` 的 collection。无 `vector` 时只要求 column 未 DISABLED 且关系表存在。
+- 请求里的 `payload` key 必须已经注册到 `SYS_VECTOR_PAYLOAD_FIELDS_` 且 `FIELD_STATUS=ACTIVE`。服务会用 `SOURCE_COLUMN_NAME` 写关系表列，用 `SYNC_ENABLED=Y` 的字段构造 Qdrant payload。
+- 关系表向量列按 `SYS_VECTOR_COLUMNS_.VECTOR_ENCODING` 编码：`FLOAT32_LE`、`FLOAT16_LE` 或 `INT8`。
+- Qdrant 写入目标优先使用 collection alias；若 alias 为空，则直接写 collection name。
+- 当前是同步 MVP，不引入 outbox。关系库 DML 和 Qdrant HTTP 调用不具备跨资源原子提交能力；生产级强一致/重试建议后续演进为 outbox + worker。
+- 当 `SIDECAR_QDRANT_ENABLED=false` 且有 `vector` 时，关系表 insert 仍会执行，Qdrant upsert 返回 `SKIPPED_DISABLED`，用于本地开发验证；无 `vector` 时返回 `SKIPPED_SCALAR_ONLY`。
 
 ### Create Table 时的 Qdrant 侧行为
 
@@ -185,7 +239,7 @@ collection/index 的状态不应在业务代码中到处传裸字符串。当前
 
 1. 先在目标数据库执行 sidecar 系统表 DDL
 2. 再启动 sidecar 服务
-3. 最后调用 API（可通过 `POST /api/v1/vector-schemas/tables` 建业务表并自动注册向量列）
+3. 最后调用 API（业务优先通过 `POST /api/v1/vector-tables` 建业务表并自动注册向量列、collection/index 和 payload fields）
 
 ## 启动方式
 
@@ -257,15 +311,42 @@ export SIDECAR_DB_PASSWORD='manager'
 
 ## 本地快速验证
 
-### 1) 结构化建表（推荐）
+### 1) 简化建表（业务推荐）
+
+```bash
+curl -X POST 'http://localhost:8080/api/v1/vector-tables' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "tenantId":"T1",
+    "schemaName":"PUBLIC",
+    "tableName":"DOC_INSERT_DEMO",
+    "primaryKey":{"name":"ID","type":"BIGINT"},
+    "scalarColumns":[
+      {"name":"TITLE","type":"VARCHAR","length":200,"nullable":true,"payloadKey":"title"},
+      {"name":"DOC_TYPE","type":"VARCHAR","length":50,"nullable":true,"payloadKey":"docType"},
+      {"name":"SCORE","type":"DOUBLE","nullable":true,"payloadKey":"score","payloadSyncEnabled":false}
+    ],
+    "vectorColumn":{
+      "name":"EMBEDDING",
+      "dimension":3,
+      "nullable":true
+    }
+  }'
+```
+
+这个接口默认使用 Qdrant、FLOAT32、COSINE、`FULL_AND_INCREMENTAL`，并自动注册默认 collection/index。带 `payloadKey` 的 scalar column 会自动注册为 payload field。
+
+### 1.1) 高级结构化建表（控制面接口）
+
+需要显式控制 engine/index/vector 参数时使用：
 
 ```bash
 curl -X POST 'http://localhost:8080/api/v1/vector-schemas/tables' \
   -H 'Content-Type: application/json' \
   -d '{
     "tenantId":"T1",
-    "schemaName":"SYS",
-    "tableName":"DOC_STORE_VT_DEMO",
+    "schemaName":"PUBLIC",
+    "tableName":"DOC_ADVANCED_DEMO",
     "engineType":"QDRANT",
     "ifNotExists":true,
     "autoRegisterCollection":true,
@@ -287,9 +368,9 @@ curl -X POST 'http://localhost:8080/api/v1/vector-schemas/tables' \
   }'
 ```
 
-### 1.1) 校验 Qdrant 侧是否已创建资源
+### 1.2) 校验 Qdrant 侧是否已创建资源
 
-`POST /api/v1/vector-schemas/tables` 的响应里会返回 `columnId / collectionId / indexId / tableName`。
+建表响应里会返回 `columnId / collectionId / indexId / tableName`。
 
 ```bash
 # 1) 查系统表里的 collection 状态（应看到 ACTIVE + READY）
@@ -321,6 +402,45 @@ curl -X POST 'http://localhost:8080/api/v1/vector-columns' \
 
 # 查询
 curl 'http://localhost:8080/api/v1/vector-columns'
+```
+
+### 3) 同步 insert
+
+有 vector 的 insert 前需要已有 ACTIVE column、READY collection，并按需注册 payload field。下面示例假设该向量列维度为 3；实际请求长度必须等于元数据中的 `dimension`。
+
+```bash
+curl -X POST 'http://localhost:8080/api/v1/vector-data/insert' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "tenantId":"T1",
+    "schemaName":"PUBLIC",
+    "tableName":"DOC_INSERT_DEMO",
+    "vectorColumn":"EMBEDDING",
+    "pk":100,
+    "vector":[0.1,0.2,0.3],
+    "payload":{
+      "title":"first doc",
+      "docType":"news",
+      "score":9.5
+    }
+  }'
+```
+
+纯标量 insert 不传 `vector`，只写关系表。若表下只有一个已注册向量列，也可以不传 `vectorColumn`。
+
+```bash
+curl -X POST 'http://localhost:8080/api/v1/vector-data/insert' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "tenantId":"T1",
+    "schemaName":"PUBLIC",
+    "tableName":"DOC_INSERT_DEMO",
+    "pk":101,
+    "payload":{
+      "title":"scalar only",
+      "docType":"news"
+    }
+  }'
 ```
 
 ## 依赖约束（Jackson / Boot 4）

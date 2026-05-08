@@ -17,7 +17,15 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @SpringBootTest
 @AutoConfigureMockMvc
 @ActiveProfiles("local")
-@Sql(statements = "DELETE FROM SYS_VECTOR_COLUMNS_", executionPhase = Sql.ExecutionPhase.BEFORE_TEST_METHOD)
+@Sql(statements = {
+        "DELETE FROM SYS_VECTOR_SYNC_ERRORS_",
+        "DELETE FROM SYS_VECTOR_SYNC_PROGRESS_",
+        "DELETE FROM SYS_VECTOR_SYNC_JOBS_",
+        "DELETE FROM SYS_VECTOR_PAYLOAD_FIELDS_",
+        "DELETE FROM SYS_VECTOR_INDEXES_",
+        "DELETE FROM SYS_VECTOR_COLLECTIONS_",
+        "DELETE FROM SYS_VECTOR_COLUMNS_"
+}, executionPhase = Sql.ExecutionPhase.BEFORE_TEST_METHOD)
 class VectorRegistryControllerIT {
 
     @Autowired

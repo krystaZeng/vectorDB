@@ -1,6 +1,7 @@
 package com.krystal.vectorsidecarservice.infrastructure.vectorengine.qdrant;
 
 import com.krystal.vectorsidecarservice.application.port.out.VectorEngineAdminPort;
+import com.krystal.vectorsidecarservice.application.port.out.VectorEngineDataPort;
 import com.krystal.vectorsidecarservice.common.exception.BizException;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
@@ -14,10 +15,11 @@ import tools.jackson.databind.ObjectMapper;
 import tools.jackson.databind.node.ObjectNode;
 
 import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
 
 @Component
-public class QdrantVectorEngineAdminAdapter implements VectorEngineAdminPort {
+public class QdrantVectorEngineAdminAdapter implements VectorEngineAdminPort, VectorEngineDataPort {
 
     private final RestClient restClient;
     private final ObjectMapper objectMapper;
@@ -143,6 +145,26 @@ public class QdrantVectorEngineAdminAdapter implements VectorEngineAdminPort {
         }
     }
 
+    @Override
+    public UpsertPointResult upsertPoint(UpsertPointCommand command) {
+        if (!enabled) {
+            return UpsertPointResult.skippedDisabled("qdrant data write is disabled");
+        }
+        ObjectNode payload = buildUpsertPointPayload(command);
+        try {
+            restClient.put()
+                    .uri("/collections/{collection}/points?wait=true", command.collectionName())
+                    .headers(this::applyApiKey)
+                    .header(HttpHeaders.CONTENT_TYPE, "application/json")
+                    .body(payload)
+                    .retrieve()
+                    .toBodilessEntity();
+            return UpsertPointResult.upserted("point upserted: " + command.collectionName());
+        } catch (RestClientResponseException ex) {
+            throw new BizException(formatHttpError("upsertPoint", ex), ex);
+        }
+    }
+
     private boolean collectionExists(String collectionName) {
         try {
             restClient.get()
@@ -241,6 +263,71 @@ public class QdrantVectorEngineAdminAdapter implements VectorEngineAdminPort {
         mergeJsonObject(payload, command.quantizationConfigJson(), "quantization_config");
         mergeExtraCollectionConfig(payload, command.collectionConfigJson());
         return payload;
+    }
+
+    private ObjectNode buildUpsertPointPayload(UpsertPointCommand command) {
+        ObjectNode payload = objectMapper.createObjectNode();
+        ObjectNode point = objectMapper.createObjectNode();
+        putPointId(point, command.pointId());
+        putPointVector(point, command.vectorName(), command.vector());
+        putPayload(point, command.payload());
+        payload.putArray("points").add(point);
+        return payload;
+    }
+
+    private void putPointId(ObjectNode point, Object pointId) {
+        if (pointId instanceof Number number) {
+            point.put("id", number.longValue());
+            return;
+        }
+        if (pointId instanceof String text && !text.isBlank()) {
+            point.put("id", text);
+            return;
+        }
+        throw new BizException("qdrant point id must be a number or string");
+    }
+
+    private void putPointVector(ObjectNode point, String vectorName, java.util.List<Float> vector) {
+        if (vectorName == null || vectorName.isBlank() || vectorName.equalsIgnoreCase("default")) {
+            var vectorArray = point.putArray("vector");
+            vector.forEach(vectorArray::add);
+            return;
+        }
+        ObjectNode namedVectors = objectMapper.createObjectNode();
+        var vectorArray = namedVectors.putArray(vectorName);
+        vector.forEach(vectorArray::add);
+        point.set("vector", namedVectors);
+    }
+
+    private void putPayload(ObjectNode point, Map<String, Object> payloadValues) {
+        if (payloadValues == null || payloadValues.isEmpty()) {
+            return;
+        }
+        ObjectNode payload = objectMapper.createObjectNode();
+        payloadValues.forEach((key, value) -> putScalar(payload, key, value));
+        point.set("payload", payload);
+    }
+
+    private void putScalar(ObjectNode node, String key, Object value) {
+        if (value == null) {
+            node.putNull(key);
+        } else if (value instanceof String text) {
+            node.put(key, text);
+        } else if (value instanceof Integer number) {
+            node.put(key, number);
+        } else if (value instanceof Long number) {
+            node.put(key, number);
+        } else if (value instanceof Float number) {
+            node.put(key, number);
+        } else if (value instanceof Double number) {
+            node.put(key, number);
+        } else if (value instanceof Boolean bool) {
+            node.put(key, bool);
+        } else if (value instanceof Number number) {
+            node.put(key, number.doubleValue());
+        } else {
+            throw new BizException("qdrant payload value must be scalar for key: " + key);
+        }
     }
 
     private void mergeJsonObject(ObjectNode target, String rawJson, String fieldName) {
