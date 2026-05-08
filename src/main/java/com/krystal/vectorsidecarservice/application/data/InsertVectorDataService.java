@@ -1,15 +1,16 @@
 package com.krystal.vectorsidecarservice.application.data;
 
 import com.krystal.vectorsidecarservice.application.port.in.InsertVectorDataUseCase;
+import com.krystal.vectorsidecarservice.application.port.out.IdGeneratorPort;
 import com.krystal.vectorsidecarservice.application.port.out.RelationalSchemaPort;
 import com.krystal.vectorsidecarservice.application.port.out.VectorCollectionPort;
 import com.krystal.vectorsidecarservice.application.port.out.VectorDataRelationalPort;
-import com.krystal.vectorsidecarservice.application.port.out.VectorEngineDataPort;
 import com.krystal.vectorsidecarservice.application.port.out.VectorMetadataPort;
+import com.krystal.vectorsidecarservice.application.port.out.VectorOutboxEventPort;
 import com.krystal.vectorsidecarservice.application.port.out.VectorPayloadFieldPort;
 import com.krystal.vectorsidecarservice.application.registry.lifecycle.VectorColumnLifecycle;
-import com.krystal.vectorsidecarservice.application.system.VectorEngineDataRouter;
 import com.krystal.vectorsidecarservice.common.exception.BizException;
+import com.krystal.vectorsidecarservice.domain.data.VectorOutboxEventMeta;
 import com.krystal.vectorsidecarservice.domain.registry.VectorCollectionMeta;
 import com.krystal.vectorsidecarservice.domain.registry.VectorColumnMeta;
 import com.krystal.vectorsidecarservice.domain.registry.VectorPayloadFieldMeta;
@@ -17,14 +18,12 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.math.BigDecimal;
-import java.math.BigInteger;
+import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
-import java.util.UUID;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
@@ -41,8 +40,10 @@ public class InsertVectorDataService implements InsertVectorDataUseCase {
     private final VectorPayloadFieldPort vectorPayloadFieldPort;
     private final RelationalSchemaPort relationalSchemaPort;
     private final VectorDataRelationalPort vectorDataRelationalPort;
-    private final VectorEngineDataRouter vectorEngineDataRouter;
+    private final VectorOutboxEventPort vectorOutboxEventPort;
+    private final IdGeneratorPort idGenerator;
     private final VectorValueEncoder vectorValueEncoder;
+    private final VectorPointIdNormalizer pointIdNormalizer;
 
     @Override
     @Transactional
@@ -65,9 +66,6 @@ public class InsertVectorDataService implements InsertVectorDataUseCase {
         byte[] vectorBytes = vectorProvided
                 ? vectorValueEncoder.encode(command.vector(), column.dimension(), column.vectorEncoding())
                 : null;
-        List<Float> qdrantVector = vectorProvided
-                ? vectorValueEncoder.toFloatVector(command.vector(), column.dimension())
-                : List.of();
 
         PayloadValues payloadValues = payloadValues(column, command.payload());
         validateNoColumnCollision(column, payloadValues.scalarValues().keySet());
@@ -92,16 +90,10 @@ public class InsertVectorDataService implements InsertVectorDataUseCase {
         }
 
         VectorCollectionMeta collection = readyCollection(column.columnId());
-        NormalizedPointId pointId = normalizePointId(command.pk(), collection.qdrantIdType());
+        VectorPointIdNormalizer.NormalizedPointId pointId = pointIdNormalizer.normalize(command.pk(), collection.qdrantIdType());
         String writeTargetName = writeTargetName(collection);
-        VectorEngineDataPort.UpsertPointResult upsertResult = vectorEngineDataRouter.get(collection.engineType())
-                .upsertPoint(new VectorEngineDataPort.UpsertPointCommand(
-                        writeTargetName,
-                        collection.qdrantVectorName(),
-                        pointId.value(),
-                        qdrantVector,
-                        payloadValues.qdrantPayload()
-                ));
+        VectorOutboxEventMeta outboxEvent = createOutboxEvent(column, command.pk(), pointId.text());
+        vectorOutboxEventPort.save(outboxEvent);
 
         return new InsertVectorDataResult(
                 column.tenantId(),
@@ -113,10 +105,11 @@ public class InsertVectorDataService implements InsertVectorDataUseCase {
                 collection.collectionName(),
                 writeTargetName,
                 pointId.text(),
+                outboxEvent.eventId(),
                 true,
                 true,
-                upsertResult.status().name(),
-                upsertResult.message()
+                "PENDING_OUTBOX",
+                "qdrant upsert event enqueued: " + outboxEvent.eventId()
         );
     }
 
@@ -164,10 +157,41 @@ public class InsertVectorDataService implements InsertVectorDataUseCase {
                 null,
                 null,
                 null,
+                null,
                 true,
                 false,
                 "SKIPPED_SCALAR_ONLY",
                 "vector is not provided; qdrant upsert skipped"
+        );
+    }
+
+    private VectorOutboxEventMeta createOutboxEvent(
+            VectorColumnMeta column,
+            Object pk,
+            String pointId
+    ) {
+        Instant now = Instant.now();
+        String sourcePk = pointIdNormalizer.relationalPkText(pk);
+        String pkValueType = pointIdNormalizer.pkValueType(pk);
+        String dedupeKey = column.columnId() + ":" + sourcePk + ":UPSERT";
+        return new VectorOutboxEventMeta(
+                idGenerator.nextId(),
+                column.columnId(),
+                "UPSERT",
+                "PENDING",
+                sourcePk,
+                pointId,
+                pkValueType,
+                dedupeKey,
+                0,
+                now,
+                null,
+                null,
+                null,
+                null,
+                null,
+                now,
+                now
         );
     }
 
@@ -237,55 +261,6 @@ public class InsertVectorDataService implements InsertVectorDataUseCase {
         }
     }
 
-    private NormalizedPointId normalizePointId(Object pk, String qdrantIdType) {
-        String idType = qdrantIdType == null ? "UINT64" : qdrantIdType.trim().toUpperCase(Locale.ROOT);
-        return switch (idType) {
-            case "UINT64" -> uint64PointId(pk);
-            case "UUID" -> uuidPointId(pk);
-            default -> throw new BizException("unsupported qdrantIdType: " + qdrantIdType);
-        };
-    }
-
-    private NormalizedPointId uint64PointId(Object pk) {
-        BigInteger value;
-        if (pk instanceof Number number) {
-            value = exactInteger(number);
-        } else if (pk instanceof String text) {
-            try {
-                value = new BigInteger(text.trim());
-            } catch (NumberFormatException ex) {
-                throw new BizException("pk must be a non-negative integer for UINT64 qdrant id", ex);
-            }
-        } else {
-            throw new BizException("pk must be a non-negative integer for UINT64 qdrant id");
-        }
-        if (value.signum() < 0 || value.bitLength() > 63) {
-            throw new BizException("pk must be a non-negative integer for UINT64 qdrant id");
-        }
-        long longValue = value.longValue();
-        return new NormalizedPointId(longValue, String.valueOf(longValue));
-    }
-
-    private BigInteger exactInteger(Number number) {
-        try {
-            return new BigDecimal(number.toString()).toBigIntegerExact();
-        } catch (ArithmeticException | NumberFormatException ex) {
-            throw new BizException("pk must be a non-negative integer for UINT64 qdrant id", ex);
-        }
-    }
-
-    private NormalizedPointId uuidPointId(Object pk) {
-        if (!(pk instanceof String text)) {
-            throw new BizException("pk must be a UUID string for UUID qdrant id");
-        }
-        try {
-            UUID uuid = UUID.fromString(text.trim());
-            return new NormalizedPointId(uuid.toString(), uuid.toString());
-        } catch (IllegalArgumentException ex) {
-            throw new BizException("pk must be a UUID string for UUID qdrant id", ex);
-        }
-    }
-
     private String writeTargetName(VectorCollectionMeta collection) {
         if (collection.aliasName() != null && !collection.aliasName().isBlank()) {
             return collection.aliasName();
@@ -321,6 +296,4 @@ public class InsertVectorDataService implements InsertVectorDataUseCase {
     private record PayloadValues(Map<String, Object> scalarValues, Map<String, Object> qdrantPayload) {
     }
 
-    private record NormalizedPointId(Object value, String text) {
-    }
 }

@@ -10,8 +10,10 @@ import org.springframework.stereotype.Repository;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.regex.Pattern;
 
 @Repository
@@ -56,6 +58,42 @@ public class JdbcVectorDataRepository implements VectorDataRelationalPort {
         } catch (DataAccessException ex) {
             throw new BizException("failed to insert vector row", ex);
         }
+    }
+
+    @Override
+    public Optional<VectorRow> findByPk(FindRowCommand command) {
+        String vectorColumn = identifier(command.vectorColumn(), "vectorColumn");
+        List<String> scalarColumns = command.scalarColumns() == null ? List.of() : command.scalarColumns()
+                .stream()
+                .map(column -> identifier(column, "scalar column"))
+                .distinct()
+                .toList();
+        List<String> selectColumns = new ArrayList<>();
+        selectColumns.add(vectorColumn);
+        selectColumns.addAll(scalarColumns);
+        String sql = "SELECT "
+                + String.join(", ", selectColumns)
+                + " FROM "
+                + identifier(command.schemaName(), "schemaName")
+                + "."
+                + identifier(command.tableName(), "tableName")
+                + " WHERE "
+                + identifier(command.pkColumn(), "pkColumn")
+                + " = ?";
+
+        return jdbcTemplate.query(connection -> {
+                    PreparedStatement ps = connection.prepareStatement(sql);
+                    ps.setObject(1, command.pkValue());
+                    return ps;
+                }, (rs, rowNum) -> {
+                    Map<String, Object> scalarValues = new LinkedHashMap<>();
+                    for (String scalarColumn : scalarColumns) {
+                        scalarValues.put(scalarColumn, rs.getObject(scalarColumn));
+                    }
+                    return new VectorRow(rs.getBytes(vectorColumn), scalarValues);
+                })
+                .stream()
+                .findFirst();
     }
 
     private void bindValues(PreparedStatement ps, List<Object> values) throws SQLException {

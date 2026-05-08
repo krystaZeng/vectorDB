@@ -132,9 +132,10 @@ collection/index 的状态不应在业务代码中到处传裸字符串。当前
 
 ## 当前架构边界与后续演进
 
-当前代码是清晰的同步式控制面 MVP，但还不是完整生产级异步工作流。需要重点关注这些演进点：
+当前代码是清晰的控制面 MVP。insert 链路已经改为 outbox 最终一致；provisioning 仍是同步编排。需要重点关注这些演进点：
 
 - provisioning 目前是同步编排：建表/注册元数据后直接调用 Qdrant，再写 `READY` 或 `FAILED`。如果后续 provisioning 耗时变长，应改为异步 worker/outbox 模式。
+- insert 当前以关系库为事实源：API 事务内写业务表和 `SYS_VECTOR_OUTBOX_EVENTS_`，worker 异步 upsert Qdrant。
 - `collection/index` 已有 lifecycle，`sync job` 后续也应引入类似组件，统一 `PENDING -> RUNNING -> SUCCESS/FAILED/PAUSED/CANCELED` 的流转规则。
 - DDL 当前以初始化脚本维护；系统表开始频繁变更后，建议引入 Flyway 或 Liquibase 管理版本迁移。
 - 对外 API 后续最好区分“注册元数据”和“状态动作”。外部调用方不宜长期直接传状态字段，状态变化应通过明确动作接口完成。
@@ -144,7 +145,7 @@ collection/index 的状态不应在业务代码中到处传裸字符串。当前
 当前已经加入两层保护：
 
 - 应用层 `VectorMetadataReferenceGuard`：注册 collection/index/payload field 以及写 sync progress/error 时，会校验父记录存在、父子归属一致，并校验 collection/index 的维度和 metric 与 column 定义匹配。
-- 数据库层单列 FK：新库初始化脚本已为 collection/index/payload field/sync job/progress/error 加入父记录外键，防止绕过 API 写入不存在父记录的悬挂数据。
+- 数据库层单列 FK：新库初始化脚本已为 collection/index/payload field/outbox/sync job/progress/error 加入父记录外键，防止绕过 API 写入不存在父记录的悬挂数据。
 
 边界说明：
 
@@ -162,10 +163,11 @@ collection/index 的状态不应在业务代码中到处传裸字符串。当前
 - `POST/GET /api/v1/vector-collections` 管理 `SYS_VECTOR_COLLECTIONS_`
 - `POST/GET /api/v1/vector-indexes` 管理 `SYS_VECTOR_INDEXES_`
 - `POST/GET /api/v1/vector-payload-fields` 管理 `SYS_VECTOR_PAYLOAD_FIELDS_`
+- `GET /api/v1/vector-outbox-events` 查询 insert 到 Qdrant 的 outbox 事件状态
 - `POST/GET /api/v1/vector-sync-jobs` 管理 `SYS_VECTOR_SYNC_JOBS_`
 - `POST/GET /api/v1/vector-sync-progress` 管理 `SYS_VECTOR_SYNC_PROGRESS_`
 - `POST/GET /api/v1/vector-sync-errors` 管理 `SYS_VECTOR_SYNC_ERRORS_`
-- `POST /api/v1/vector-data/insert` 同步写入关系表；有 vector 时同时 upsert Qdrant point
+- `POST /api/v1/vector-data/insert` 同步写入关系表；有 vector 时写入 outbox，Qdrant point 由 worker 异步 upsert
 
 ## API 使用建议
 
@@ -211,14 +213,45 @@ scalar column 可以声明 `payloadKey`。声明后服务会自动注册 `SYS_VE
 - `POST /api/v1/vector-data/insert` 对外不要求传 `columnId`。若传 `vectorColumn`，使用 `tenantId + schemaName + tableName + vectorColumn` 解析内部元数据；若不传 `vectorColumn`，表下必须只有一个已注册向量列。
 - insert 支持三种形态：
   - 纯标量：不传 `vector`，只写关系表，不要求 READY collection，不调用 Qdrant。
-  - 纯向量：传 `pk + vector`，写关系表向量列，并 upsert Qdrant point。
-  - 标量 + 向量：传 `pk + vector + payload`，写关系表并 upsert Qdrant point/payload。
+  - 纯向量：传 `pk + vector`，写关系表向量列，并写入 outbox 事件。
+  - 标量 + 向量：传 `pk + vector + payload`，写关系表并写入 outbox 事件。
 - 有 `vector` 时只消费严格可用资源：`SYS_VECTOR_COLUMNS_.STATUS=ACTIVE`，且存在 `SERVING_STATE=ACTIVE / COLLECTION_STATUS=READY` 的 collection。无 `vector` 时只要求 column 未 DISABLED 且关系表存在。
-- 请求里的 `payload` key 必须已经注册到 `SYS_VECTOR_PAYLOAD_FIELDS_` 且 `FIELD_STATUS=ACTIVE`。服务会用 `SOURCE_COLUMN_NAME` 写关系表列，用 `SYNC_ENABLED=Y` 的字段构造 Qdrant payload。
+- 请求里的 `payload` key 必须已经注册到 `SYS_VECTOR_PAYLOAD_FIELDS_` 且 `FIELD_STATUS=ACTIVE`。服务会用 `SOURCE_COLUMN_NAME` 写关系表列；worker 处理 outbox 时会重新读取 `SYNC_ENABLED=Y` 的字段构造 Qdrant payload。
 - 关系表向量列按 `SYS_VECTOR_COLUMNS_.VECTOR_ENCODING` 编码：`FLOAT32_LE`、`FLOAT16_LE` 或 `INT8`。
 - Qdrant 写入目标优先使用 collection alias；若 alias 为空，则直接写 collection name。
-- 当前是同步 MVP，不引入 outbox。关系库 DML 和 Qdrant HTTP 调用不具备跨资源原子提交能力；生产级强一致/重试建议后续演进为 outbox + worker。
-- 当 `SIDECAR_QDRANT_ENABLED=false` 且有 `vector` 时，关系表 insert 仍会执行，Qdrant upsert 返回 `SKIPPED_DISABLED`，用于本地开发验证；无 `vector` 时返回 `SKIPPED_SCALAR_ONLY`。
+- insert API 不在请求事务里调用 Qdrant；有 vector 时返回 `vectorUpsertStatus=PENDING_OUTBOX` 和 `outboxEventId`。
+- 关系库业务行和 outbox 事件在同一个 DB 事务内提交。Qdrant 是派生索引，由 worker 最终一致写入。
+- worker 至少一次消费 outbox。Qdrant point id 使用稳定主键，重复 upsert 是幂等的。
+- outbox 状态包括 `PENDING / PROCESSING / DONE / RETRYING / DEAD`；失败会记录 `RETRY_COUNT / NEXT_RETRY_AT / ERROR_CODE / ERROR_MESSAGE`。
+- 如果 worker 未启用，vector insert 只会留下 `PENDING` outbox 事件，不会写 Qdrant。无 `vector` 时返回 `SKIPPED_SCALAR_ONLY`。
+
+## Outbox Worker
+
+`SYS_VECTOR_OUTBOX_EVENTS_` 用于承接 insert 到 Qdrant 的最终一致同步：
+
+- insert 事务内写业务表和 outbox 事件。
+- worker 定时扫描 `PENDING/RETRYING` 且到期的事件。
+- worker 原子抢占事件为 `PROCESSING`，避免多实例重复处理同一行。
+- worker 根据 `columnId + pk` 重新读取关系表向量列和 payload 标量列。
+- worker 调用 Qdrant upsert，成功后标记 `DONE`。
+- 失败会按指数退避转为 `RETRYING`；超过最大次数后标记 `DEAD`。
+- 进程中断遗留的 `PROCESSING` 会在锁超时后释放回 `RETRYING`，再次消费仍依赖稳定 point id 保持幂等。
+
+默认本地关闭 worker。需要消费 outbox 时同时启用 Qdrant 和 worker：
+
+```bash
+export SIDECAR_QDRANT_ENABLED=true
+export SIDECAR_OUTBOX_WORKER_ENABLED=true
+```
+
+可选参数：
+
+- `SIDECAR_OUTBOX_WORKER_FIXED_DELAY_MS`：调度间隔，默认 `1000`
+- `SIDECAR_OUTBOX_WORKER_BATCH_SIZE`：每批事件数，默认 `50`
+- `SIDECAR_OUTBOX_WORKER_MAX_RETRIES`：最大重试次数，默认 `5`
+- `SIDECAR_OUTBOX_WORKER_INITIAL_RETRY_DELAY_MS`：首次重试延迟，默认 `1000`
+- `SIDECAR_OUTBOX_WORKER_MAX_RETRY_DELAY_MS`：最大退避延迟，默认 `60000`
+- `SIDECAR_OUTBOX_WORKER_LOCK_TIMEOUT_MS`：`PROCESSING` 锁超时，默认 `60000`
 
 ### Create Table 时的 Qdrant 侧行为
 
@@ -253,7 +286,7 @@ scalar column 可以声明 `payloadKey`。声明后服务会自动注册 `SYS_VE
 
 ### 2) 连接 Altibase 启动（`altibase`）
 
-先执行 Altibase DDL（轻量产品版 7 张系统表）：
+先执行 Altibase DDL（轻量产品版 8 张系统表）：
 
 `src/main/resources/db/altibase/001_init_sidecar.sql`
 
@@ -296,6 +329,7 @@ export SIDECAR_DB_PASSWORD='manager'
   - `collection/index` 状态保持在 `CREATING`（不会误标 `READY`）
 - `SIDECAR_QDRANT_ENABLED=true`：
   - 会按顺序执行：`ensureCollection -> ensureAlias -> ensureIndex`
+  - 当 `SIDECAR_OUTBOX_WORKER_ENABLED=true` 时，worker 会消费 outbox 并 upsert points
   - 资源命名默认规则：
     - collection：`{table}_{vectorColumn}_V1`
     - alias：`{table}_{vectorColumn}_ACTIVE`
@@ -404,9 +438,9 @@ curl -X POST 'http://localhost:8080/api/v1/vector-columns' \
 curl 'http://localhost:8080/api/v1/vector-columns'
 ```
 
-### 3) 同步 insert
+### 3) 最终一致 insert
 
-有 vector 的 insert 前需要已有 ACTIVE column、READY collection，并按需注册 payload field。下面示例假设该向量列维度为 3；实际请求长度必须等于元数据中的 `dimension`。
+有 vector 的 insert 前需要已有 ACTIVE column、READY collection，并按需注册 payload field。下面示例假设该向量列维度为 3；实际请求长度必须等于元数据中的 `dimension`。响应中的 `vectorUpsertStatus=PENDING_OUTBOX` 表示关系表已写入，Qdrant upsert 已进入 outbox 等待 worker 消费。
 
 ```bash
 curl -X POST 'http://localhost:8080/api/v1/vector-data/insert' \

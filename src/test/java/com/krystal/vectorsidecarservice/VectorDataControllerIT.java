@@ -27,6 +27,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
         "DELETE FROM SYS_VECTOR_SYNC_PROGRESS_",
         "DELETE FROM SYS_VECTOR_SYNC_JOBS_",
         "DELETE FROM SYS_VECTOR_PAYLOAD_FIELDS_",
+        "DELETE FROM SYS_VECTOR_OUTBOX_EVENTS_",
         "DELETE FROM SYS_VECTOR_INDEXES_",
         "DELETE FROM SYS_VECTOR_COLLECTIONS_",
         "DELETE FROM SYS_VECTOR_COLUMNS_"
@@ -40,7 +41,7 @@ class VectorDataControllerIT {
     private JdbcTemplate jdbcTemplate;
 
     @Test
-    void shouldInsertRelationalRowAndSkipQdrantWhenDisabled() throws Exception {
+    void shouldInsertRelationalRowAndEnqueueOutboxEvent() throws Exception {
         long columnId = createVectorTable();
         registerReadyCollection(columnId);
         registerPayloadField(columnId);
@@ -68,9 +69,10 @@ class VectorDataControllerIT {
                 .andExpect(jsonPath("$.data.tableName").value("DOC_INSERT"))
                 .andExpect(jsonPath("$.data.vectorColumn").value("EMBEDDING"))
                 .andExpect(jsonPath("$.data.pointId").value("100"))
+                .andExpect(jsonPath("$.data.outboxEventId").isNumber())
                 .andExpect(jsonPath("$.data.relationalInserted").value(true))
                 .andExpect(jsonPath("$.data.vectorInserted").value(true))
-                .andExpect(jsonPath("$.data.vectorUpsertStatus").value("SKIPPED_DISABLED"));
+                .andExpect(jsonPath("$.data.vectorUpsertStatus").value("PENDING_OUTBOX"));
 
         Integer rowCount = jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM PUBLIC.DOC_INSERT WHERE ID = 100 AND DOC_TYPE = 'news'",
@@ -83,10 +85,17 @@ class VectorDataControllerIT {
                 byte[].class
         );
         assertThat(vectorBytes).hasSize(12);
+
+        Integer outboxCount = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM SYS_VECTOR_OUTBOX_EVENTS_ WHERE COLUMN_ID = ? AND SOURCE_PK = '100' AND EVENT_STATUS = 'PENDING'",
+                Integer.class,
+                columnId
+        );
+        assertThat(outboxCount).isEqualTo(1);
     }
 
     @Test
-    void shouldInsertVectorOnlyRelationalRowAndSkipQdrantWhenDisabled() throws Exception {
+    void shouldInsertVectorOnlyRelationalRowAndEnqueueOutboxEvent() throws Exception {
         long columnId = createVectorTable();
         registerReadyCollection(columnId);
 
@@ -110,9 +119,10 @@ class VectorDataControllerIT {
                 .andExpect(jsonPath("$.data.tableName").value("DOC_INSERT"))
                 .andExpect(jsonPath("$.data.vectorColumn").value("EMBEDDING"))
                 .andExpect(jsonPath("$.data.pointId").value("103"))
+                .andExpect(jsonPath("$.data.outboxEventId").isNumber())
                 .andExpect(jsonPath("$.data.relationalInserted").value(true))
                 .andExpect(jsonPath("$.data.vectorInserted").value(true))
-                .andExpect(jsonPath("$.data.vectorUpsertStatus").value("SKIPPED_DISABLED"));
+                .andExpect(jsonPath("$.data.vectorUpsertStatus").value("PENDING_OUTBOX"));
 
         Integer rowCount = jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM PUBLIC.DOC_INSERT WHERE ID = 103 AND DOC_TYPE IS NULL",
@@ -125,6 +135,13 @@ class VectorDataControllerIT {
                 byte[].class
         );
         assertThat(vectorBytes).hasSize(12);
+
+        Integer outboxCount = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM SYS_VECTOR_OUTBOX_EVENTS_ WHERE COLUMN_ID = ? AND SOURCE_PK = '103' AND EVENT_STATUS = 'PENDING'",
+                Integer.class,
+                columnId
+        );
+        assertThat(outboxCount).isEqualTo(1);
     }
 
     @Test
@@ -152,6 +169,7 @@ class VectorDataControllerIT {
                 .andExpect(jsonPath("$.data.columnId").value(columnId))
                 .andExpect(jsonPath("$.data.tableName").value("DOC_INSERT"))
                 .andExpect(jsonPath("$.data.vectorColumn").value("EMBEDDING"))
+                .andExpect(jsonPath("$.data.outboxEventId").doesNotExist())
                 .andExpect(jsonPath("$.data.relationalInserted").value(true))
                 .andExpect(jsonPath("$.data.vectorInserted").value(false))
                 .andExpect(jsonPath("$.data.vectorUpsertStatus").value("SKIPPED_SCALAR_ONLY"));

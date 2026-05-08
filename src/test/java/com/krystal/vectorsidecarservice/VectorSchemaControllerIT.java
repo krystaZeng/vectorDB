@@ -30,6 +30,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
         "DELETE FROM SYS_VECTOR_SYNC_PROGRESS_",
         "DELETE FROM SYS_VECTOR_SYNC_JOBS_",
         "DELETE FROM SYS_VECTOR_PAYLOAD_FIELDS_",
+        "DELETE FROM SYS_VECTOR_OUTBOX_EVENTS_",
         "DELETE FROM SYS_VECTOR_INDEXES_",
         "DELETE FROM SYS_VECTOR_COLLECTIONS_",
         "DELETE FROM SYS_VECTOR_COLUMNS_"

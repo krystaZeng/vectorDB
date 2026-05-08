@@ -28,6 +28,18 @@ public class VectorValueEncoder {
                 .toList();
     }
 
+    public List<Float> decodeToFloatVector(byte[] vectorBytes, int dimension, String vectorEncoding) {
+        if (vectorBytes == null || vectorBytes.length == 0) {
+            throw new BizException("vector bytes must not be empty");
+        }
+        return switch (normalizeEncoding(vectorEncoding)) {
+            case "FLOAT32_LE" -> decodeFloat32(vectorBytes, dimension);
+            case "FLOAT16_LE" -> decodeFloat16(vectorBytes, dimension);
+            case "INT8" -> decodeInt8(vectorBytes, dimension);
+            default -> throw new BizException("vectorEncoding must be one of FLOAT32_LE, FLOAT16_LE, INT8");
+        };
+    }
+
     private void validateVector(List<Double> vector, int dimension) {
         if (vector == null || vector.isEmpty()) {
             throw new BizException("vector must not be empty");
@@ -90,6 +102,60 @@ public class VectorValueEncoder {
             return (short) (sign | 0x7c00);
         }
         return (short) (sign | (exponent << 10) | ((mantissa + 0x1000) >> 13));
+    }
+
+    private List<Float> decodeFloat32(byte[] vectorBytes, int dimension) {
+        requireByteLength(vectorBytes, dimension * Float.BYTES);
+        ByteBuffer buffer = ByteBuffer.wrap(vectorBytes).order(ByteOrder.LITTLE_ENDIAN);
+        return java.util.stream.IntStream.range(0, dimension)
+                .mapToObj(index -> buffer.getFloat())
+                .toList();
+    }
+
+    private List<Float> decodeFloat16(byte[] vectorBytes, int dimension) {
+        requireByteLength(vectorBytes, dimension * Short.BYTES);
+        ByteBuffer buffer = ByteBuffer.wrap(vectorBytes).order(ByteOrder.LITTLE_ENDIAN);
+        return java.util.stream.IntStream.range(0, dimension)
+                .mapToObj(index -> halfToFloat(buffer.getShort()))
+                .toList();
+    }
+
+    private List<Float> decodeInt8(byte[] vectorBytes, int dimension) {
+        requireByteLength(vectorBytes, dimension);
+        return java.util.stream.IntStream.range(0, dimension)
+                .mapToObj(index -> (float) vectorBytes[index])
+                .toList();
+    }
+
+    private void requireByteLength(byte[] vectorBytes, int expectedLength) {
+        if (vectorBytes.length != expectedLength) {
+            throw new BizException("vector byte length mismatch: expected " + expectedLength + ", actual " + vectorBytes.length);
+        }
+    }
+
+    private float halfToFloat(short half) {
+        int bits = half & 0xffff;
+        int sign = (bits & 0x8000) << 16;
+        int exponent = (bits >>> 10) & 0x1f;
+        int mantissa = bits & 0x03ff;
+
+        if (exponent == 0) {
+            if (mantissa == 0) {
+                return Float.intBitsToFloat(sign);
+            }
+            while ((mantissa & 0x0400) == 0) {
+                mantissa <<= 1;
+                exponent--;
+            }
+            exponent++;
+            mantissa &= ~0x0400;
+        } else if (exponent == 31) {
+            return Float.intBitsToFloat(sign | 0x7f800000 | (mantissa << 13));
+        }
+
+        exponent = exponent + (127 - 15);
+        mantissa = mantissa << 13;
+        return Float.intBitsToFloat(sign | (exponent << 23) | mantissa);
     }
 
     private String normalizeEncoding(String vectorEncoding) {

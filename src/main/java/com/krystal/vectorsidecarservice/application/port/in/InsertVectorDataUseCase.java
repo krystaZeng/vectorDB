@@ -28,6 +28,7 @@ public interface InsertVectorDataUseCase {
             String collectionName,
             String writeTargetName,
             String pointId,
+            Long outboxEventId,
             boolean relationalInserted,
             boolean vectorInserted,
             String vectorUpsertStatus,
