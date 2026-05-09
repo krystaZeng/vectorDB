@@ -71,12 +71,13 @@ public class CreateVectorTableService implements CreateVectorTableUseCase {
         if (command.primaryKey() == null) {
             throw new BizException("primaryKey must not be null");
         }
-        if (command.vectorColumn() == null) {
-            throw new BizException("vectorColumn must not be null");
-        }
         String engineType = normalizeEngineType(command.engineType());
+        boolean vectorTable = command.vectorColumn() != null;
         boolean autoRegisterCollection = Boolean.TRUE.equals(command.autoRegisterCollection());
         boolean autoRegisterIndex = Boolean.TRUE.equals(command.autoRegisterIndex());
+        if (!vectorTable && (autoRegisterCollection || autoRegisterIndex)) {
+            throw new BizException("autoRegisterCollection/autoRegisterIndex require vectorColumn");
+        }
         if (autoRegisterIndex && !autoRegisterCollection) {
             throw new BizException("autoRegisterIndex requires autoRegisterCollection=true");
         }
@@ -85,7 +86,7 @@ public class CreateVectorTableService implements CreateVectorTableUseCase {
         String tableName = normalizeIdentifier(command.tableName(), "tableName", null);
         PrimaryKeySpec primaryKey = normalizePrimaryKey(command.primaryKey());
         List<ScalarColumnSpec> scalarColumns = normalizeScalarColumns(command.scalarColumns());
-        VectorColumnSpec vectorColumn = normalizeVectorColumn(command.vectorColumn());
+        VectorColumnSpec vectorColumn = vectorTable ? normalizeVectorColumn(command.vectorColumn()) : null;
 
         ensureNoDuplicateColumns(primaryKey, scalarColumns, vectorColumn);
 
@@ -97,6 +98,20 @@ public class CreateVectorTableService implements CreateVectorTableUseCase {
                 vectorColumn,
                 relationalSchemaPort.databaseDialect()
         );
+        boolean ifNotExists = command.ifNotExists() == null || command.ifNotExists();
+        if (vectorColumn == null) {
+            DdlResult ddlResult = ensureRelationalTable(
+                    schemaName,
+                    tableName,
+                    primaryKey,
+                    scalarColumns,
+                    null,
+                    ddl,
+                    ifNotExists
+            );
+            return createScalarOnlyResult(schemaName, tableName, ddlResult, ddl);
+        }
+
         String definitionHash = definitionHash(
                 command,
                 engineType,
@@ -110,7 +125,6 @@ public class CreateVectorTableService implements CreateVectorTableUseCase {
                 ddl
         );
 
-        boolean ifNotExists = command.ifNotExists() == null || command.ifNotExists();
         StageAResult stageA = transactionTemplate.execute(status -> prepareMetadata(
                 command,
                 engineType,
@@ -161,6 +175,27 @@ public class CreateVectorTableService implements CreateVectorTableUseCase {
         }
 
         return createResult(schemaName, tableName, vectorColumn, stageA, ddlResult, ddl);
+    }
+
+    private CreateVectorTableResult createScalarOnlyResult(
+            String schemaName,
+            String tableName,
+            DdlResult ddlResult,
+            String ddl
+    ) {
+        return new CreateVectorTableResult(
+                schemaName,
+                tableName,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                ddlResult.createdByThisAttempt(),
+                ddl
+        );
     }
 
     private CreateVectorTableResult createResult(
@@ -518,12 +553,14 @@ public class CreateVectorTableService implements CreateVectorTableUseCase {
                     scalarColumn.nullable()
             ));
         }
-        columns.add(new RelationalSchemaPort.ColumnDefinition(
-                vectorColumn.name(),
-                vectorStorageType(relationalSchemaPort.databaseDialect()),
-                vectorStorageLength(vectorColumn),
-                vectorColumn.nullable()
-        ));
+        if (vectorColumn != null) {
+            columns.add(new RelationalSchemaPort.ColumnDefinition(
+                    vectorColumn.name(),
+                    vectorStorageType(relationalSchemaPort.databaseDialect()),
+                    vectorStorageLength(vectorColumn),
+                    vectorColumn.nullable()
+            ));
+        }
         return new RelationalSchemaPort.TableDefinition(schemaName, tableName, primaryKey.name(), columns);
     }
 
@@ -889,7 +926,9 @@ public class CreateVectorTableService implements CreateVectorTableUseCase {
         for (ScalarColumnSpec scalarColumn : scalarColumns) {
             checkDuplicate(names, scalarColumn.name(), "scalarColumns.name");
         }
-        checkDuplicate(names, vectorColumn.name(), "vectorColumn.name");
+        if (vectorColumn != null) {
+            checkDuplicate(names, vectorColumn.name(), "vectorColumn.name");
+        }
     }
 
     private void checkDuplicate(Set<String> names, String columnName, String fieldName) {

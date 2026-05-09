@@ -176,7 +176,7 @@ collection/index 的状态不应在业务代码中到处传裸字符串。当前
 - 建表：`POST /api/v1/vector-tables`
 - 写入：`POST /api/v1/vector-data/insert`
 
-`/api/v1/vector-tables` 会隐藏控制面默认值：
+`/api/v1/vector-tables` 会隐藏控制面默认值。传入 `vectorColumn` 时，默认值为：
 
 - `engineType=QDRANT`
 - `ifNotExists=true`
@@ -187,19 +187,22 @@ collection/index 的状态不应在业务代码中到处传裸字符串。当前
 - `metricType=COSINE`
 - `syncMode=FULL_AND_INCREMENTAL`
 
-scalar column 可以声明 `payloadKey`。声明后服务会自动注册 `SYS_VECTOR_PAYLOAD_FIELDS_`，后续 insert 请求里的 `payload` 就可以使用这个 key。`payloadSyncEnabled=false` 表示该字段只写关系表，不同步到 Qdrant payload。
+`vectorColumn` 现在是可选项。不传 `vectorColumn` 时，接口只创建纯标量关系表，不注册 `SYS_VECTOR_COLUMNS_`、collection、index 或 payload field 元数据；此时 scalar column 不允许声明 `payloadKey`、`payloadSyncEnabled`、`payloadFieldType`。
+
+传入 `vectorColumn` 时，scalar column 可以声明 `payloadKey`。声明后服务会自动注册 `SYS_VECTOR_PAYLOAD_FIELDS_`，后续 insert 请求里的 `payload` 就可以使用这个 key。`payloadSyncEnabled=false` 表示该字段只写关系表，不同步到 Qdrant payload。
 
 `/api/v1/vector-schemas/tables`、`/api/v1/vector-columns`、`/api/v1/vector-collections`、`/api/v1/vector-indexes`、`/api/v1/vector-payload-fields` 保留为高级/控制面接口，用于自定义 engine、index profile、手工注册或排障修复，不建议普通业务链路直接依赖这些细粒度接口。
 
 ## Create Table 执行边界
 
-- `POST /api/v1/vector-tables` 是推荐业务入口，本质上复用结构化建表编排，并自动补齐默认 collection/index/payload metadata。
+- `POST /api/v1/vector-tables` 是推荐业务入口，本质上复用结构化建表编排。传入 `vectorColumn` 时会自动补齐默认 collection/index/payload metadata；不传 `vectorColumn` 时只创建纯标量关系表。
 - `POST /api/v1/vector-schemas/tables` 会在关系库中执行真实 `CREATE TABLE`（通过 JDBC）
 - 不是仅注册系统表；返回里 `ddlExecuted=true/false` 用于表示是否真的执行了 DDL
 - 当 `ifNotExists=true` 且表已存在时，不再执行 DDL（`ddlExecuted=false`）
-- create workflow 会先写 `BUILDING` 元数据，再执行 DDL/provisioning；DDL 隐式提交导致的半成功可通过相同 `DEFINITION_HASH` 的请求恢复
+- 有 `vectorColumn` 时，create workflow 会先写 `BUILDING` 元数据，再执行 DDL/provisioning；DDL 隐式提交导致的半成功可通过相同 `DEFINITION_HASH` 的请求恢复
 - 恢复 `BUILDING` 时不会简单认为“表存在就是成功”，而是通过 JDBC metadata 校验表名、主键、向量列、维度对应的存储长度、类型和 nullable
 - 同一向量列如果传入不同定义，`DEFINITION_HASH` 不一致，会按冲突拒绝；`FAILED` 状态不会被普通 create 请求自动重试
+- 无 `vectorColumn` 时没有 vector metadata 和 `DEFINITION_HASH`，只做关系表 DDL 执行和既有表结构校验。
 - DDL 幂等恢复只处理可恢复失败：`OBJECT_ALREADY_EXISTS` 或执行结果不确定的超时/连接中断。语法错误、权限不足、类型不支持等 `NON_RETRYABLE` 错误不会被“表存在”轻易吞掉
 - 服务内部使用 `DdlResult.CREATED_BY_THIS_ATTEMPT / ALREADY_EXISTS_AND_MATCHED` 表达 DDL 结果；API 里的 `ddlExecuted=false` 只表示本次请求没有新建表，但后续 metadata 修复、Qdrant provisioning 和状态推进仍会继续
 - 向量列在 Altibase 中落为 `VARBYTE(N)`，`N=dimension*bytesPerElement`
@@ -369,6 +372,23 @@ curl -X POST 'http://localhost:8080/api/v1/vector-tables' \
 ```
 
 这个接口默认使用 Qdrant、FLOAT32、COSINE、`FULL_AND_INCREMENTAL`，并自动注册默认 collection/index。带 `payloadKey` 的 scalar column 会自动注册为 payload field。
+
+创建纯标量表时省略 `vectorColumn`，并且不要在 scalar column 上声明 payload metadata：
+
+```bash
+curl -X POST 'http://localhost:8080/api/v1/vector-tables' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "tenantId":"T1",
+    "schemaName":"PUBLIC",
+    "tableName":"DOC_SCALAR_DEMO",
+    "primaryKey":{"name":"ID","type":"BIGINT"},
+    "scalarColumns":[
+      {"name":"TITLE","type":"VARCHAR","length":200,"nullable":true},
+      {"name":"DOC_TYPE","type":"VARCHAR","length":50,"nullable":true}
+    ]
+  }'
+```
 
 ### 1.1) 高级结构化建表（控制面接口）
 

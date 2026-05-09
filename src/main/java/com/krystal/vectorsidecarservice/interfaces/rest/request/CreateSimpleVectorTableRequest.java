@@ -13,7 +13,7 @@ public record CreateSimpleVectorTableRequest(
         @NotBlank String tableName,
         @NotNull @Valid PrimaryKeyRequest primaryKey,
         @Valid List<@Valid ScalarColumnRequest> scalarColumns,
-        @NotNull @Valid VectorColumnRequest vectorColumn
+        @Valid VectorColumnRequest vectorColumn
 ) {
 
     public record PrimaryKeyRequest(

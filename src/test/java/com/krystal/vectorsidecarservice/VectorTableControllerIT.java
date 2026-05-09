@@ -24,6 +24,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @ActiveProfiles("local")
 @Sql(statements = {
         "DROP TABLE IF EXISTS PUBLIC.DOC_SIMPLE",
+        "DROP TABLE IF EXISTS PUBLIC.DOC_SIMPLE_SCALAR",
         "DELETE FROM SYS_VECTOR_SYNC_ERRORS_",
         "DELETE FROM SYS_VECTOR_SYNC_PROGRESS_",
         "DELETE FROM SYS_VECTOR_SYNC_JOBS_",
@@ -155,6 +156,99 @@ class VectorTableControllerIT {
                 byte[].class
         );
         assertThat(vectorBytes).isNull();
+    }
+
+    @Test
+    void shouldCreateSimpleScalarOnlyTableWithoutVectorMetadata() throws Exception {
+        String createPayload = """
+                {
+                  "tenantId": "tenant_simple",
+                  "schemaName": "public",
+                  "tableName": "doc_simple_scalar",
+                  "primaryKey": {
+                    "name": "id",
+                    "type": "bigint"
+                  },
+                  "scalarColumns": [
+                    {
+                      "name": "title",
+                      "type": "varchar",
+                      "length": 200,
+                      "nullable": true
+                    },
+                    {
+                      "name": "doc_type",
+                      "type": "varchar",
+                      "length": 50,
+                      "nullable": true
+                    }
+                  ]
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/vector-tables")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(createPayload))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.schemaName").value("PUBLIC"))
+                .andExpect(jsonPath("$.data.tableName").value("DOC_SIMPLE_SCALAR"))
+                .andExpect(jsonPath("$.data.vectorColumn").value(org.hamcrest.Matchers.nullValue()))
+                .andExpect(jsonPath("$.data.dimension").value(org.hamcrest.Matchers.nullValue()))
+                .andExpect(jsonPath("$.data.metricType").value(org.hamcrest.Matchers.nullValue()))
+                .andExpect(jsonPath("$.data.columnId").value(org.hamcrest.Matchers.nullValue()))
+                .andExpect(jsonPath("$.data.collectionId").value(org.hamcrest.Matchers.nullValue()))
+                .andExpect(jsonPath("$.data.indexId").value(org.hamcrest.Matchers.nullValue()))
+                .andExpect(jsonPath("$.data.ddlExecuted").value(true))
+                .andExpect(jsonPath("$.data.payloadFields.length()").value(0));
+
+        Integer tableCount = jdbcTemplate.queryForObject(
+                """
+                        SELECT COUNT(*)
+                        FROM INFORMATION_SCHEMA.TABLES
+                        WHERE TABLE_SCHEMA = 'PUBLIC'
+                          AND TABLE_NAME = 'DOC_SIMPLE_SCALAR'
+                        """,
+                Integer.class
+        );
+        assertThat(tableCount).isEqualTo(1);
+
+        Integer vectorMetadataCount = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM SYS_VECTOR_COLUMNS_",
+                Integer.class
+        );
+        assertThat(vectorMetadataCount).isZero();
+    }
+
+    @Test
+    void shouldRejectSimpleScalarOnlyTableWithPayloadMetadata() throws Exception {
+        String createPayload = """
+                {
+                  "tenantId": "tenant_simple",
+                  "schemaName": "public",
+                  "tableName": "doc_simple_scalar",
+                  "primaryKey": {
+                    "name": "id",
+                    "type": "bigint"
+                  },
+                  "scalarColumns": [
+                    {
+                      "name": "title",
+                      "type": "varchar",
+                      "length": 200,
+                      "nullable": true,
+                      "payloadKey": "title"
+                    }
+                  ]
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/vector-tables")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(createPayload))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.message").value("payload metadata requires vectorColumn"));
     }
 
     private long getDataLong(String body, String field) {

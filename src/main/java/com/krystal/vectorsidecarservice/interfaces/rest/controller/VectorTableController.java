@@ -40,7 +40,7 @@ public class VectorTableController {
                                         column.payloadFieldType()
                                 ))
                                 .toList(),
-                        new CreateSimpleVectorTableUseCase.VectorColumnSpec(
+                        request.vectorColumn() == null ? null : new CreateSimpleVectorTableUseCase.VectorColumnSpec(
                                 request.vectorColumn().name(),
                                 request.vectorColumn().dimension(),
                                 request.vectorColumn().nullable()

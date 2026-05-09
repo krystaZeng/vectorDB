@@ -36,8 +36,9 @@ public class CreateSimpleVectorTableService implements CreateSimpleVectorTableUs
         if (command.primaryKey() == null) {
             throw new BizException("primaryKey must not be null");
         }
-        if (command.vectorColumn() == null) {
-            throw new BizException("vectorColumn must not be null");
+        boolean vectorTable = command.vectorColumn() != null;
+        if (!vectorTable) {
+            ensureNoPayloadMetadata(command.scalarColumns());
         }
 
         CreateVectorTableUseCase.CreateVectorTableResult tableResult = createVectorTableUseCase.create(
@@ -47,29 +48,28 @@ public class CreateSimpleVectorTableService implements CreateSimpleVectorTableUs
                         command.tableName(),
                         DEFAULT_ENGINE_TYPE,
                         true,
-                        true,
-                        true,
+                        vectorTable,
+                        vectorTable,
                         DEFAULT_INDEX_PROFILE,
                         new CreateVectorTableUseCase.PrimaryKeySpec(
                                 command.primaryKey().name(),
                                 command.primaryKey().type()
                         ),
                         scalarColumns(command.scalarColumns()),
-                        new CreateVectorTableUseCase.VectorColumnSpec(
+                        vectorTable ? new CreateVectorTableUseCase.VectorColumnSpec(
                                 command.vectorColumn().name(),
                                 command.vectorColumn().dimension(),
                                 DEFAULT_ELEMENT_TYPE,
                                 DEFAULT_METRIC_TYPE,
                                 DEFAULT_SYNC_MODE,
                                 command.vectorColumn().nullable()
-                        )
+                        ) : null
                 )
         );
 
-        List<PayloadFieldResult> payloadFields = registerPayloadFields(
-                tableResult.columnId(),
-                command.scalarColumns()
-        );
+        List<PayloadFieldResult> payloadFields = tableResult.columnId() == null
+                ? List.of()
+                : registerPayloadFields(tableResult.columnId(), command.scalarColumns());
         return new CreateSimpleVectorTableResult(
                 tableResult.schemaName(),
                 tableResult.tableName(),
@@ -83,6 +83,19 @@ public class CreateSimpleVectorTableService implements CreateSimpleVectorTableUs
                 tableResult.ddlExecuted(),
                 payloadFields
         );
+    }
+
+    private void ensureNoPayloadMetadata(List<ScalarColumnSpec> scalarColumns) {
+        if (scalarColumns == null || scalarColumns.isEmpty()) {
+            return;
+        }
+        for (ScalarColumnSpec scalarColumn : scalarColumns) {
+            if (hasText(scalarColumn.payloadKey())
+                    || scalarColumn.payloadSyncEnabled() != null
+                    || hasText(scalarColumn.payloadFieldType())) {
+                throw new BizException("payload metadata requires vectorColumn");
+            }
+        }
     }
 
     private List<CreateVectorTableUseCase.ScalarColumnSpec> scalarColumns(List<ScalarColumnSpec> scalarColumns) {

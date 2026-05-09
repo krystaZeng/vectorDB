@@ -29,9 +29,11 @@ public class AltibaseCreateTableSqlBuilder {
             columnDefinitions.add("    " + scalarColumn.name() + " " + typeDef + nullableSql);
         }
 
-        String vectorType = vectorStorageType(vectorColumn.dimension(), vectorColumn.elementType(), dialect);
-        String vectorNullableSql = Boolean.FALSE.equals(vectorColumn.nullable()) ? " NOT NULL" : "";
-        columnDefinitions.add("    " + vectorColumn.name() + " " + vectorType + vectorNullableSql);
+        if (vectorColumn != null) {
+            String vectorType = vectorStorageType(vectorColumn.dimension(), vectorColumn.elementType(), dialect);
+            String vectorNullableSql = Boolean.FALSE.equals(vectorColumn.nullable()) ? " NOT NULL" : "";
+            columnDefinitions.add("    " + vectorColumn.name() + " " + vectorType + vectorNullableSql);
+        }
         columnDefinitions.add("    PRIMARY KEY (" + primaryKey.name() + ")");
 
         return "CREATE TABLE " + schemaName + "." + tableName + " (\n"

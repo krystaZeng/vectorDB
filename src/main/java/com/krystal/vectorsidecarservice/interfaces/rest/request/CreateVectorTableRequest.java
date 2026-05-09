@@ -18,7 +18,7 @@ public record CreateVectorTableRequest(
         String defaultIndexProfileName,
         @NotNull @Valid PrimaryKeyRequest primaryKey,
         @Valid List<@Valid ScalarColumnRequest> scalarColumns,
-        @NotNull @Valid VectorColumnRequest vectorColumn
+        @Valid VectorColumnRequest vectorColumn
 ) {
 
     public record PrimaryKeyRequest(

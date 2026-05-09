@@ -26,6 +26,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
         "DROP TABLE IF EXISTS PUBLIC.DOC_STORE",
         "DROP TABLE IF EXISTS PUBLIC.DOC_STORE_AUTO",
         "DROP TABLE IF EXISTS PUBLIC.DOC_STORE_CONFLICT",
+        "DROP TABLE IF EXISTS PUBLIC.DOC_STORE_SCALAR",
         "DELETE FROM SYS_VECTOR_SYNC_ERRORS_",
         "DELETE FROM SYS_VECTOR_SYNC_PROGRESS_",
         "DELETE FROM SYS_VECTOR_SYNC_JOBS_",
@@ -251,6 +252,105 @@ class VectorSchemaControllerIT {
                 .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.containsString(
                         "vector column definition conflicts with existing metadata"
                 )));
+    }
+
+    @Test
+    void shouldCreateScalarOnlyBusinessTableWithoutVectorMetadata() throws Exception {
+        String payload = """
+                {
+                  "tenantId": "tenant_scalar",
+                  "schemaName": "public",
+                  "tableName": "doc_store_scalar",
+                  "ifNotExists": true,
+                  "primaryKey": {
+                    "name": "id",
+                    "type": "bigint"
+                  },
+                  "scalarColumns": [
+                    {
+                      "name": "title",
+                      "type": "varchar",
+                      "length": 200,
+                      "nullable": true
+                    },
+                    {
+                      "name": "category",
+                      "type": "varchar",
+                      "length": 50,
+                      "nullable": true
+                    }
+                  ]
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/vector-schemas/tables")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(payload))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.schemaName").value("PUBLIC"))
+                .andExpect(jsonPath("$.data.tableName").value("DOC_STORE_SCALAR"))
+                .andExpect(jsonPath("$.data.vectorColumn").value(org.hamcrest.Matchers.nullValue()))
+                .andExpect(jsonPath("$.data.dimension").value(org.hamcrest.Matchers.nullValue()))
+                .andExpect(jsonPath("$.data.metricType").value(org.hamcrest.Matchers.nullValue()))
+                .andExpect(jsonPath("$.data.columnId").value(org.hamcrest.Matchers.nullValue()))
+                .andExpect(jsonPath("$.data.collectionId").value(org.hamcrest.Matchers.nullValue()))
+                .andExpect(jsonPath("$.data.indexId").value(org.hamcrest.Matchers.nullValue()))
+                .andExpect(jsonPath("$.data.indexProfileName").value(org.hamcrest.Matchers.nullValue()))
+                .andExpect(jsonPath("$.data.ddlExecuted").value(true));
+
+        Integer tableCount = jdbcTemplate.queryForObject(
+                """
+                        SELECT COUNT(*)
+                        FROM INFORMATION_SCHEMA.TABLES
+                        WHERE TABLE_SCHEMA = 'PUBLIC'
+                          AND TABLE_NAME = 'DOC_STORE_SCALAR'
+                        """,
+                Integer.class
+        );
+        assertThat(tableCount).isEqualTo(1);
+
+        Integer vectorColumnCount = jdbcTemplate.queryForObject(
+                """
+                        SELECT COUNT(*)
+                        FROM INFORMATION_SCHEMA.COLUMNS
+                        WHERE TABLE_SCHEMA = 'PUBLIC'
+                          AND TABLE_NAME = 'DOC_STORE_SCALAR'
+                          AND COLUMN_NAME = 'EMBEDDING'
+                        """,
+                Integer.class
+        );
+        assertThat(vectorColumnCount).isZero();
+
+        Integer vectorMetadataCount = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM SYS_VECTOR_COLUMNS_",
+                Integer.class
+        );
+        assertThat(vectorMetadataCount).isZero();
+    }
+
+    @Test
+    void shouldRejectScalarOnlyTableWhenAutoRegisterVectorResourcesIsRequested() throws Exception {
+        String payload = """
+                {
+                  "tenantId": "tenant_scalar",
+                  "schemaName": "public",
+                  "tableName": "doc_store_scalar",
+                  "ifNotExists": true,
+                  "autoRegisterCollection": true,
+                  "primaryKey": {
+                    "name": "id",
+                    "type": "bigint"
+                  }
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/vector-schemas/tables")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(payload))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.message").value("autoRegisterCollection/autoRegisterIndex require vectorColumn"));
     }
 
     private long getDataLong(String body, String field) {

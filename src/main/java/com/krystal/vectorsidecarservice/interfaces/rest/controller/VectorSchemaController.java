@@ -37,14 +37,7 @@ public class VectorSchemaController {
                                 request.primaryKey().type()
                         ),
                         mapScalarColumns(request),
-                        new CreateVectorTableUseCase.VectorColumnSpec(
-                                request.vectorColumn().name(),
-                                request.vectorColumn().dimension(),
-                                request.vectorColumn().elementType(),
-                                request.vectorColumn().metricType(),
-                                request.vectorColumn().syncMode(),
-                                request.vectorColumn().nullable()
-                        )
+                        mapVectorColumn(request)
                 )
         );
         return ApiResponse.ok(CreateVectorTableResponse.from(result));
@@ -62,5 +55,19 @@ public class VectorSchemaController {
                         scalar.nullable()
                 ))
                 .toList();
+    }
+
+    private CreateVectorTableUseCase.VectorColumnSpec mapVectorColumn(CreateVectorTableRequest request) {
+        if (request.vectorColumn() == null) {
+            return null;
+        }
+        return new CreateVectorTableUseCase.VectorColumnSpec(
+                request.vectorColumn().name(),
+                request.vectorColumn().dimension(),
+                request.vectorColumn().elementType(),
+                request.vectorColumn().metricType(),
+                request.vectorColumn().syncMode(),
+                request.vectorColumn().nullable()
+        );
     }
 }
