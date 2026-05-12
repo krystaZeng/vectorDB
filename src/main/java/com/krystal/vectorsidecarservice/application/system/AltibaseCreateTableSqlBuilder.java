@@ -12,6 +12,8 @@ import java.util.Locale;
 @Component
 public class AltibaseCreateTableSqlBuilder {
 
+    public static final String ROW_VERSION_COLUMN = "ROW_VERSION";
+
     public String build(
             String schemaName,
             String tableName,
@@ -22,6 +24,7 @@ public class AltibaseCreateTableSqlBuilder {
     ) {
         List<String> columnDefinitions = new ArrayList<>();
         columnDefinitions.add("    " + primaryKey.name() + " " + normalizeScalarType(primaryKey.type(), null) + " NOT NULL");
+        columnDefinitions.add("    " + ROW_VERSION_COLUMN + " BIGINT NOT NULL");
 
         for (CreateVectorTableUseCase.ScalarColumnSpec scalarColumn : scalarColumns) {
             String typeDef = normalizeScalarType(scalarColumn.type(), scalarColumn.length());

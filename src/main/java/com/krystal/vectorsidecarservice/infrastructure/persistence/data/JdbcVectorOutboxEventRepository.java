@@ -21,20 +21,54 @@ import java.util.Optional;
 public class JdbcVectorOutboxEventRepository extends JdbcTimeSupport implements VectorOutboxEventPort {
 
     private static final String COLUMNS = """
-            EVENT_ID, COLUMN_ID, EVENT_TYPE, EVENT_STATUS, SOURCE_PK, POINT_ID, PK_VALUE_TYPE, DEDUPE_KEY,
+            EVENT_ID, TENANT_ID, COLUMN_ID, EVENT_KEY, ACTIVE_KEY, EVENT_TYPE, SOURCE_OP, EVENT_STATUS,
+            SOURCE_PK, POINT_ID, PK_VALUE_TYPE, DEDUPE_KEY, SOURCE_VERSION, NEEDS_RESYNC,
             RETRY_COUNT, NEXT_RETRY_AT, NEXT_RETRY_AT_EPOCH_MS, LOCKED_BY, LOCKED_AT, LOCKED_AT_EPOCH_MS,
-            FINISHED_AT, FINISHED_AT_EPOCH_MS, ERROR_CODE, ERROR_MESSAGE, CREATED_AT, UPDATED_AT
+            CLAIM_TOKEN, FINISHED_AT, FINISHED_AT_EPOCH_MS, ERROR_CODE, ERROR_MESSAGE, CREATED_AT, UPDATED_AT
             """;
 
     private static final String INSERT_SQL = """
             INSERT INTO SYS_VECTOR_OUTBOX_EVENTS_ (
-                EVENT_ID, COLUMN_ID, EVENT_TYPE, EVENT_STATUS, SOURCE_PK, POINT_ID, PK_VALUE_TYPE, DEDUPE_KEY,
+                EVENT_ID, TENANT_ID, COLUMN_ID, EVENT_KEY, ACTIVE_KEY, EVENT_TYPE, SOURCE_OP, EVENT_STATUS,
+                SOURCE_PK, POINT_ID, PK_VALUE_TYPE, DEDUPE_KEY, SOURCE_VERSION, NEEDS_RESYNC,
                 RETRY_COUNT, NEXT_RETRY_AT, NEXT_RETRY_AT_EPOCH_MS, LOCKED_BY, LOCKED_AT, LOCKED_AT_EPOCH_MS,
-                FINISHED_AT, FINISHED_AT_EPOCH_MS, ERROR_CODE, ERROR_MESSAGE, CREATED_AT, UPDATED_AT
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                CLAIM_TOKEN, FINISHED_AT, FINISHED_AT_EPOCH_MS, ERROR_CODE, ERROR_MESSAGE, CREATED_AT, UPDATED_AT
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """;
 
     private static final String FIND_BY_ID_SQL = "SELECT " + COLUMNS + " FROM SYS_VECTOR_OUTBOX_EVENTS_ WHERE EVENT_ID = ?";
+
+    private static final String FIND_BY_DEDUPE_KEY_SQL = "SELECT " + COLUMNS + " FROM SYS_VECTOR_OUTBOX_EVENTS_ WHERE DEDUPE_KEY = ?";
+
+    private static final String FIND_BY_ACTIVE_KEY_SQL = "SELECT " + COLUMNS + " FROM SYS_VECTOR_OUTBOX_EVENTS_ WHERE ACTIVE_KEY = ?";
+
+    private static final String MERGE_PENDING_OR_RETRYING_SQL = """
+            UPDATE SYS_VECTOR_OUTBOX_EVENTS_
+            SET EVENT_TYPE = ?,
+                SOURCE_OP = ?,
+                SOURCE_VERSION = ?,
+                NEEDS_RESYNC = 'N',
+                NEXT_RETRY_AT = ?,
+                NEXT_RETRY_AT_EPOCH_MS = ?,
+                ERROR_CODE = NULL,
+                ERROR_MESSAGE = NULL,
+                UPDATED_AT = ?
+            WHERE EVENT_ID = ?
+              AND ACTIVE_KEY = ?
+              AND EVENT_STATUS IN ('PENDING', 'RETRYING')
+            """;
+
+    private static final String MARK_PROCESSING_NEEDS_RESYNC_SQL = """
+            UPDATE SYS_VECTOR_OUTBOX_EVENTS_
+            SET EVENT_TYPE = ?,
+                SOURCE_OP = ?,
+                SOURCE_VERSION = ?,
+                NEEDS_RESYNC = 'Y',
+                UPDATED_AT = ?
+            WHERE EVENT_ID = ?
+              AND ACTIVE_KEY = ?
+              AND EVENT_STATUS = 'PROCESSING'
+            """;
 
     private static final String FIND_DUE_SQL = """
             SELECT
@@ -51,6 +85,7 @@ public class JdbcVectorOutboxEventRepository extends JdbcTimeSupport implements 
                 LOCKED_BY = ?,
                 LOCKED_AT = ?,
                 LOCKED_AT_EPOCH_MS = ?,
+                CLAIM_TOKEN = ?,
                 NEXT_RETRY_AT = NULL,
                 NEXT_RETRY_AT_EPOCH_MS = NULL,
                 ERROR_CODE = NULL,
@@ -67,6 +102,7 @@ public class JdbcVectorOutboxEventRepository extends JdbcTimeSupport implements 
                 LOCKED_BY = NULL,
                 LOCKED_AT = NULL,
                 LOCKED_AT_EPOCH_MS = NULL,
+                CLAIM_TOKEN = NULL,
                 NEXT_RETRY_AT = ?,
                 NEXT_RETRY_AT_EPOCH_MS = ?,
                 ERROR_CODE = 'LOCK_EXPIRED',
@@ -79,9 +115,11 @@ public class JdbcVectorOutboxEventRepository extends JdbcTimeSupport implements 
     private static final String MARK_DONE_SQL = """
             UPDATE SYS_VECTOR_OUTBOX_EVENTS_
             SET EVENT_STATUS = 'DONE',
+                ACTIVE_KEY = NULL,
                 LOCKED_BY = NULL,
                 LOCKED_AT = NULL,
                 LOCKED_AT_EPOCH_MS = NULL,
+                CLAIM_TOKEN = NULL,
                 NEXT_RETRY_AT = NULL,
                 NEXT_RETRY_AT_EPOCH_MS = NULL,
                 FINISHED_AT = ?,
@@ -90,6 +128,29 @@ public class JdbcVectorOutboxEventRepository extends JdbcTimeSupport implements 
                 ERROR_MESSAGE = NULL,
                 UPDATED_AT = ?
             WHERE EVENT_ID = ?
+              AND EVENT_STATUS = 'PROCESSING'
+              AND CLAIM_TOKEN = ?
+              AND SOURCE_VERSION = ?
+              AND NEEDS_RESYNC = 'N'
+            """;
+
+    private static final String MARK_DONE_RESYNC_SQL = """
+            UPDATE SYS_VECTOR_OUTBOX_EVENTS_
+            SET EVENT_STATUS = 'PENDING',
+                NEEDS_RESYNC = 'N',
+                LOCKED_BY = NULL,
+                LOCKED_AT = NULL,
+                LOCKED_AT_EPOCH_MS = NULL,
+                CLAIM_TOKEN = NULL,
+                NEXT_RETRY_AT = ?,
+                NEXT_RETRY_AT_EPOCH_MS = ?,
+                ERROR_CODE = NULL,
+                ERROR_MESSAGE = NULL,
+                UPDATED_AT = ?
+            WHERE EVENT_ID = ?
+              AND EVENT_STATUS = 'PROCESSING'
+              AND CLAIM_TOKEN = ?
+              AND (NEEDS_RESYNC = 'Y' OR SOURCE_VERSION <> ?)
             """;
 
     private static final String MARK_RETRY_SQL = """
@@ -99,12 +160,17 @@ public class JdbcVectorOutboxEventRepository extends JdbcTimeSupport implements 
                 LOCKED_BY = NULL,
                 LOCKED_AT = NULL,
                 LOCKED_AT_EPOCH_MS = NULL,
+                CLAIM_TOKEN = NULL,
                 NEXT_RETRY_AT = ?,
                 NEXT_RETRY_AT_EPOCH_MS = ?,
                 ERROR_CODE = ?,
                 ERROR_MESSAGE = ?,
                 UPDATED_AT = ?
             WHERE EVENT_ID = ?
+              AND EVENT_STATUS = 'PROCESSING'
+              AND CLAIM_TOKEN = ?
+              AND SOURCE_VERSION = ?
+              AND NEEDS_RESYNC = 'N'
             """;
 
     private static final String MARK_DEAD_SQL = """
@@ -114,6 +180,7 @@ public class JdbcVectorOutboxEventRepository extends JdbcTimeSupport implements 
                 LOCKED_BY = NULL,
                 LOCKED_AT = NULL,
                 LOCKED_AT_EPOCH_MS = NULL,
+                CLAIM_TOKEN = NULL,
                 NEXT_RETRY_AT = NULL,
                 NEXT_RETRY_AT_EPOCH_MS = NULL,
                 FINISHED_AT = ?,
@@ -122,23 +189,54 @@ public class JdbcVectorOutboxEventRepository extends JdbcTimeSupport implements 
                 ERROR_MESSAGE = ?,
                 UPDATED_AT = ?
             WHERE EVENT_ID = ?
+              AND EVENT_STATUS = 'PROCESSING'
+              AND CLAIM_TOKEN = ?
+              AND SOURCE_VERSION = ?
+              AND NEEDS_RESYNC = 'N'
+            """;
+
+    private static final String RETRY_DEAD_SQL = """
+            UPDATE SYS_VECTOR_OUTBOX_EVENTS_
+            SET EVENT_STATUS = 'PENDING',
+                NEEDS_RESYNC = 'N',
+                RETRY_COUNT = 0,
+                LOCKED_BY = NULL,
+                LOCKED_AT = NULL,
+                LOCKED_AT_EPOCH_MS = NULL,
+                CLAIM_TOKEN = NULL,
+                NEXT_RETRY_AT = ?,
+                NEXT_RETRY_AT_EPOCH_MS = ?,
+                FINISHED_AT = NULL,
+                FINISHED_AT_EPOCH_MS = NULL,
+                ERROR_CODE = NULL,
+                ERROR_MESSAGE = NULL,
+                UPDATED_AT = ?
+            WHERE EVENT_ID = ?
+              AND EVENT_STATUS = 'DEAD'
             """;
 
     private final JdbcTemplate jdbcTemplate;
 
     private final RowMapper<VectorOutboxEventMeta> mapper = (rs, rowNum) -> new VectorOutboxEventMeta(
             rs.getLong("EVENT_ID"),
+            rs.getString("TENANT_ID"),
             rs.getLong("COLUMN_ID"),
+            rs.getString("EVENT_KEY"),
+            rs.getString("ACTIVE_KEY"),
             rs.getString("EVENT_TYPE"),
+            rs.getString("SOURCE_OP"),
             rs.getString("EVENT_STATUS"),
             rs.getString("SOURCE_PK"),
             rs.getString("POINT_ID"),
             rs.getString("PK_VALUE_TYPE"),
             rs.getString("DEDUPE_KEY"),
+            rs.getLong("SOURCE_VERSION"),
+            rs.getString("NEEDS_RESYNC"),
             rs.getInt("RETRY_COUNT"),
             instant((Long) rs.getObject("NEXT_RETRY_AT_EPOCH_MS"), rs.getTimestamp("NEXT_RETRY_AT")),
             rs.getString("LOCKED_BY"),
             instant((Long) rs.getObject("LOCKED_AT_EPOCH_MS"), rs.getTimestamp("LOCKED_AT")),
+            rs.getString("CLAIM_TOKEN"),
             instant((Long) rs.getObject("FINISHED_AT_EPOCH_MS"), rs.getTimestamp("FINISHED_AT")),
             rs.getString("ERROR_CODE"),
             rs.getString("ERROR_MESSAGE"),
@@ -152,19 +250,26 @@ public class JdbcVectorOutboxEventRepository extends JdbcTimeSupport implements 
             jdbcTemplate.update(
                     INSERT_SQL,
                     event.eventId(),
+                    event.tenantId(),
                     event.columnId(),
+                    event.eventKey(),
+                    event.activeKey(),
                     event.eventType(),
+                    event.sourceOp(),
                     event.eventStatus(),
                     event.sourcePk(),
                     event.pointId(),
                     event.pkValueType(),
                     event.dedupeKey(),
+                    event.sourceVersion(),
+                    event.needsResync(),
                     event.retryCount(),
                     timestamp(event.nextRetryAt()),
                     epochMillis(event.nextRetryAt()),
                     event.lockedBy(),
                     timestamp(event.lockedAt()),
                     epochMillis(event.lockedAt()),
+                    event.claimToken(),
                     timestamp(event.finishedAt()),
                     epochMillis(event.finishedAt()),
                     event.errorCode(),
@@ -179,10 +284,101 @@ public class JdbcVectorOutboxEventRepository extends JdbcTimeSupport implements 
     }
 
     @Override
+    public SaveResult saveOrFindByDedupeKey(VectorOutboxEventMeta event) {
+        try {
+            return new SaveResult(save(event), true);
+        } catch (BizException ex) {
+            return findByDedupeKey(event.dedupeKey())
+                    .map(existing -> new SaveResult(existing, false))
+                    .orElseThrow(() -> ex);
+        }
+    }
+
+    @Override
+    public SaveResult enqueueOrMergeActive(VectorOutboxEventMeta event) {
+        try {
+            return new SaveResult(save(event), true);
+        } catch (BizException ex) {
+            if (event.activeKey() == null || event.activeKey().isBlank()) {
+                throw ex;
+            }
+            VectorOutboxEventMeta existing = findByActiveKey(event.activeKey())
+                    .orElseThrow(() -> ex);
+            return switch (existing.eventStatus()) {
+                case "PENDING", "RETRYING" -> mergePendingOrRetrying(existing, event);
+                case "PROCESSING" -> markProcessingNeedsResync(existing, event);
+                default -> new SaveResult(existing, false);
+            };
+        }
+    }
+
+    @Override
     public Optional<VectorOutboxEventMeta> findById(long eventId) {
         return jdbcTemplate.query(FIND_BY_ID_SQL, mapper, eventId)
                 .stream()
                 .findFirst();
+    }
+
+    @Override
+    public Optional<VectorOutboxEventMeta> findByDedupeKey(String dedupeKey) {
+        return jdbcTemplate.query(FIND_BY_DEDUPE_KEY_SQL, mapper, dedupeKey)
+                .stream()
+                .findFirst();
+    }
+
+    @Override
+    public Optional<VectorOutboxEventMeta> findByActiveKey(String activeKey) {
+        return jdbcTemplate.query(FIND_BY_ACTIVE_KEY_SQL, mapper, activeKey)
+                .stream()
+                .findFirst();
+    }
+
+    private SaveResult mergePendingOrRetrying(VectorOutboxEventMeta existing, VectorOutboxEventMeta event) {
+        if (event.sourceVersion() < existing.sourceVersion()) {
+            return new SaveResult(existing, false);
+        }
+        int updated = jdbcTemplate.update(
+                MERGE_PENDING_OR_RETRYING_SQL,
+                event.eventType(),
+                event.sourceOp(),
+                event.sourceVersion(),
+                timestamp(event.nextRetryAt()),
+                epochMillis(event.nextRetryAt()),
+                timestamp(event.updatedAt()),
+                existing.eventId(),
+                event.activeKey()
+        );
+        if (updated != 1) {
+            return findByActiveKey(event.activeKey())
+                    .map(current -> new SaveResult(current, false))
+                    .orElse(new SaveResult(existing, false));
+        }
+        return findById(existing.eventId())
+                .map(current -> new SaveResult(current, false))
+                .orElse(new SaveResult(existing, false));
+    }
+
+    private SaveResult markProcessingNeedsResync(VectorOutboxEventMeta existing, VectorOutboxEventMeta event) {
+        if (event.sourceVersion() < existing.sourceVersion()) {
+            return new SaveResult(existing, false);
+        }
+        int updated = jdbcTemplate.update(
+                MARK_PROCESSING_NEEDS_RESYNC_SQL,
+                event.eventType(),
+                event.sourceOp(),
+                event.sourceVersion(),
+                timestamp(event.updatedAt()),
+                existing.eventId(),
+                event.activeKey()
+        );
+        if (updated != 1) {
+            return findByActiveKey(event.activeKey())
+                    .map(current -> new SaveResult(current, false))
+                    .orElse(new SaveResult(existing, false));
+        }
+        return findById(existing.eventId())
+                .map(current -> new SaveResult(current, false))
+                .orElse(new SaveResult(existing, false));
     }
 
     @Override
@@ -227,12 +423,13 @@ public class JdbcVectorOutboxEventRepository extends JdbcTimeSupport implements 
     }
 
     @Override
-    public Optional<VectorOutboxEventMeta> claim(long eventId, String workerId, Instant now) {
+    public Optional<VectorOutboxEventMeta> claim(long eventId, String workerId, String claimToken, Instant now) {
         int updated = jdbcTemplate.update(
                 CLAIM_SQL,
                 workerId,
                 timestamp(now),
                 epochMillis(now),
+                claimToken,
                 timestamp(now),
                 eventId,
                 epochMillis(now)
@@ -255,20 +452,43 @@ public class JdbcVectorOutboxEventRepository extends JdbcTimeSupport implements 
     }
 
     @Override
-    public void markDone(long eventId, Instant now) {
-        jdbcTemplate.update(MARK_DONE_SQL, timestamp(now), epochMillis(now), timestamp(now), eventId);
+    public OwnershipUpdateStatus markDone(long eventId, String claimToken, long processedSourceVersion, Instant now) {
+        int updated = jdbcTemplate.update(
+                MARK_DONE_SQL,
+                timestamp(now),
+                epochMillis(now),
+                timestamp(now),
+                eventId,
+                claimToken,
+                processedSourceVersion
+        );
+        if (updated == 1) {
+            return OwnershipUpdateStatus.UPDATED;
+        }
+        int resyncUpdated = jdbcTemplate.update(
+                MARK_DONE_RESYNC_SQL,
+                timestamp(now),
+                epochMillis(now),
+                timestamp(now),
+                eventId,
+                claimToken,
+                processedSourceVersion
+        );
+        return resyncUpdated == 1 ? OwnershipUpdateStatus.RESYNC_REQUIRED : OwnershipUpdateStatus.STALE_CLAIM;
     }
 
     @Override
-    public void markRetry(
+    public OwnershipUpdateStatus markRetry(
             long eventId,
+            String claimToken,
+            long processedSourceVersion,
             int retryCount,
             Instant nextRetryAt,
             String errorCode,
             String errorMessage,
             Instant now
     ) {
-        jdbcTemplate.update(
+        int updated = jdbcTemplate.update(
                 MARK_RETRY_SQL,
                 retryCount,
                 timestamp(nextRetryAt),
@@ -276,13 +496,24 @@ public class JdbcVectorOutboxEventRepository extends JdbcTimeSupport implements 
                 errorCode,
                 truncate(errorMessage),
                 timestamp(now),
-                eventId
+                eventId,
+                claimToken,
+                processedSourceVersion
         );
+        return ownershipOrResyncStatus(updated, eventId, claimToken, processedSourceVersion, now);
     }
 
     @Override
-    public void markDead(long eventId, int retryCount, String errorCode, String errorMessage, Instant now) {
-        jdbcTemplate.update(
+    public OwnershipUpdateStatus markDead(
+            long eventId,
+            String claimToken,
+            long processedSourceVersion,
+            int retryCount,
+            String errorCode,
+            String errorMessage,
+            Instant now
+    ) {
+        int updated = jdbcTemplate.update(
                 MARK_DEAD_SQL,
                 retryCount,
                 timestamp(now),
@@ -290,8 +521,48 @@ public class JdbcVectorOutboxEventRepository extends JdbcTimeSupport implements 
                 errorCode,
                 truncate(errorMessage),
                 timestamp(now),
+                eventId,
+                claimToken,
+                processedSourceVersion
+        );
+        return ownershipOrResyncStatus(updated, eventId, claimToken, processedSourceVersion, now);
+    }
+
+    @Override
+    public Optional<VectorOutboxEventMeta> retryDead(long eventId, Instant now) {
+        int updated = jdbcTemplate.update(
+                RETRY_DEAD_SQL,
+                timestamp(now),
+                epochMillis(now),
+                timestamp(now),
                 eventId
         );
+        if (updated != 1) {
+            return Optional.empty();
+        }
+        return findById(eventId);
+    }
+
+    private OwnershipUpdateStatus ownershipOrResyncStatus(
+            int updated,
+            long eventId,
+            String claimToken,
+            long processedSourceVersion,
+            Instant now
+    ) {
+        if (updated == 1) {
+            return OwnershipUpdateStatus.UPDATED;
+        }
+        int resyncUpdated = jdbcTemplate.update(
+                MARK_DONE_RESYNC_SQL,
+                timestamp(now),
+                epochMillis(now),
+                timestamp(now),
+                eventId,
+                claimToken,
+                processedSourceVersion
+        );
+        return resyncUpdated == 1 ? OwnershipUpdateStatus.RESYNC_REQUIRED : OwnershipUpdateStatus.STALE_CLAIM;
     }
 
     private String truncate(String value) {

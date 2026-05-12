@@ -1,6 +1,6 @@
 package com.krystal.vectorsidecarservice.application.data;
 
-import com.krystal.vectorsidecarservice.application.port.in.InsertVectorDataUseCase;
+import com.krystal.vectorsidecarservice.application.port.in.UpdateVectorDataUseCase;
 import com.krystal.vectorsidecarservice.application.port.out.IdGeneratorPort;
 import com.krystal.vectorsidecarservice.application.port.out.RelationalSchemaPort;
 import com.krystal.vectorsidecarservice.application.port.out.VectorCollectionPort;
@@ -30,7 +30,7 @@ import java.util.stream.Collectors;
 
 @Service
 @RequiredArgsConstructor
-public class InsertVectorDataService implements InsertVectorDataUseCase {
+public class UpdateVectorDataService implements UpdateVectorDataUseCase {
 
     private static final String DEFAULT_TENANT = "DEFAULT";
     private static final String DEFAULT_SCHEMA = "PUBLIC";
@@ -50,7 +50,7 @@ public class InsertVectorDataService implements InsertVectorDataUseCase {
 
     @Override
     @Transactional
-    public InsertVectorDataResult insert(InsertVectorDataCommand command) {
+    public UpdateVectorDataResult update(UpdateVectorDataCommand command) {
         if (command == null) {
             throw new BizException("request must not be null");
         }
@@ -62,9 +62,13 @@ public class InsertVectorDataService implements InsertVectorDataUseCase {
             throw new BizException("pk must not be null");
         }
         boolean vectorProvided = vectorProvided(command.vector());
+        boolean payloadProvided = command.payload() != null && !command.payload().isEmpty();
+        if (!vectorProvided && !payloadProvided) {
+            throw new BizException("update must provide vector or payload");
+        }
 
         VectorColumnMeta column = resolveColumn(tenantId, schemaName, tableName, vectorColumnName);
-        requireColumnWritableForInsert(column, vectorProvided);
+        requireColumnWritableForUpdate(column, vectorProvided);
 
         byte[] vectorBytes = vectorProvided
                 ? vectorValueEncoder.encode(command.vector(), column.dimension(), column.vectorEncoding())
@@ -72,13 +76,16 @@ public class InsertVectorDataService implements InsertVectorDataUseCase {
 
         PayloadValues payloadValues = payloadValues(column, command.payload());
         validateNoColumnCollision(column, payloadValues.scalarValues().keySet());
-        long sourceVersion = nextSourceVersion(column, command.pk());
         String rowVersionColumn = relationalSchemaPort.columnExists(column.schemaName(), column.tableName(), ROW_VERSION_COLUMN)
                 ? ROW_VERSION_COLUMN
                 : null;
+        if (!rowExists(column, command.pk(), rowVersionColumn)) {
+            throw new BizException("row not found for update: " + pointIdNormalizer.relationalPkText(command.pk()));
+        }
+        long sourceVersion = nextSourceVersion(column, command.pk());
 
-        int insertedRows = vectorDataRelationalPort.insert(
-                new VectorDataRelationalPort.InsertRowCommand(
+        int updatedRows = vectorDataRelationalPort.update(
+                new VectorDataRelationalPort.UpdateRowCommand(
                         column.schemaName(),
                         column.tableName(),
                         column.pkColumn(),
@@ -90,12 +97,13 @@ public class InsertVectorDataService implements InsertVectorDataUseCase {
                         payloadValues.scalarValues()
                 )
         );
-        if (insertedRows != 1) {
-            throw new BizException("insert affected unexpected row count: " + insertedRows);
+        if (updatedRows != 1) {
+            throw new BizException("row not found for update: " + pointIdNormalizer.relationalPkText(command.pk()));
         }
 
-        if (!vectorProvided) {
-            return relationalOnlyResult(column);
+        boolean vectorSyncRequired = vectorProvided || !payloadValues.qdrantPayload().isEmpty();
+        if (!vectorSyncRequired) {
+            return relationalOnlyResult(column, sourceVersion);
         }
 
         VectorCollectionMeta collection = readyCollection(column.columnId());
@@ -105,11 +113,11 @@ public class InsertVectorDataService implements InsertVectorDataUseCase {
         VectorOutboxEventPort.SaveResult outboxSaveResult = vectorOutboxEventPort.enqueueOrMergeActive(outboxEvent);
         VectorOutboxEventMeta persistedOutboxEvent = outboxSaveResult.event();
         if (!outboxSaveResult.created() && "DEAD".equals(persistedOutboxEvent.eventStatus())) {
-            throw new BizException("existing qdrant upsert event is DEAD; manual retry required: "
+            throw new BizException("existing qdrant sync event is DEAD; manual retry required: "
                     + persistedOutboxEvent.eventId());
         }
 
-        return new InsertVectorDataResult(
+        return new UpdateVectorDataResult(
                 column.tenantId(),
                 column.schemaName(),
                 column.tableName(),
@@ -120,12 +128,13 @@ public class InsertVectorDataService implements InsertVectorDataUseCase {
                 writeTargetName,
                 pointId.text(),
                 persistedOutboxEvent.eventId(),
+                persistedOutboxEvent.sourceVersion(),
                 true,
                 true,
                 "DONE".equals(persistedOutboxEvent.eventStatus()) ? "OUTBOX_DONE" : "PENDING_OUTBOX",
                 outboxSaveResult.created()
-                        ? "qdrant upsert event enqueued: " + persistedOutboxEvent.eventId()
-                        : "qdrant upsert event merged with active event: " + persistedOutboxEvent.eventId()
+                        ? "qdrant vector upsert event enqueued from update: " + persistedOutboxEvent.eventId()
+                        : "qdrant vector upsert event merged from update: " + persistedOutboxEvent.eventId()
         );
     }
 
@@ -146,7 +155,7 @@ public class InsertVectorDataService implements InsertVectorDataUseCase {
         return columns.get(0);
     }
 
-    private void requireColumnWritableForInsert(VectorColumnMeta column, boolean vectorProvided) {
+    private void requireColumnWritableForUpdate(VectorColumnMeta column, boolean vectorProvided) {
         if (vectorProvided && !VectorColumnLifecycle.ACTIVE.status().equals(column.status())) {
             throw new BizException("vector column is not ACTIVE: " + column.columnId());
         }
@@ -162,8 +171,8 @@ public class InsertVectorDataService implements InsertVectorDataUseCase {
         return vector != null && !vector.isEmpty();
     }
 
-    private InsertVectorDataResult relationalOnlyResult(VectorColumnMeta column) {
-        return new InsertVectorDataResult(
+    private UpdateVectorDataResult relationalOnlyResult(VectorColumnMeta column, long sourceVersion) {
+        return new UpdateVectorDataResult(
                 column.tenantId(),
                 column.schemaName(),
                 column.tableName(),
@@ -174,10 +183,39 @@ public class InsertVectorDataService implements InsertVectorDataUseCase {
                 null,
                 null,
                 null,
+                sourceVersion,
                 true,
                 false,
-                "SKIPPED_SCALAR_ONLY",
-                "vector is not provided; qdrant upsert skipped"
+                "SKIPPED_RELATIONAL_ONLY",
+                "updated columns do not require qdrant sync"
+        );
+    }
+
+    private boolean rowExists(VectorColumnMeta column, Object pk, String rowVersionColumn) {
+        return vectorDataRelationalPort.findByPk(
+                        new VectorDataRelationalPort.FindRowCommand(
+                                column.schemaName(),
+                                column.tableName(),
+                                column.pkColumn(),
+                                pk,
+                                column.vectorColumn(),
+                                rowVersionColumn,
+                                List.of()
+                        )
+                )
+                .isPresent();
+    }
+
+    private long nextSourceVersion(VectorColumnMeta column, Object pk) {
+        String sourcePk = pointIdNormalizer.relationalPkText(pk);
+        return vectorSourceVersionPort.nextVersion(
+                new VectorSourceVersionPort.NextVersionCommand(
+                        column.tenantId(),
+                        column.columnId(),
+                        sourcePk,
+                        eventKey(column.tenantId(), column.columnId(), sourcePk),
+                        Instant.now()
+                )
         );
     }
 
@@ -200,7 +238,7 @@ public class InsertVectorDataService implements InsertVectorDataUseCase {
                 eventKey,
                 eventKey,
                 "UPSERT",
-                "INSERT",
+                "UPDATE",
                 "PENDING",
                 sourcePk,
                 pointId,
@@ -218,19 +256,6 @@ public class InsertVectorDataService implements InsertVectorDataUseCase {
                 null,
                 now,
                 now
-        );
-    }
-
-    private long nextSourceVersion(VectorColumnMeta column, Object pk) {
-        String sourcePk = pointIdNormalizer.relationalPkText(pk);
-        return vectorSourceVersionPort.nextVersion(
-                new VectorSourceVersionPort.NextVersionCommand(
-                        column.tenantId(),
-                        column.columnId(),
-                        sourcePk,
-                        eventKey(column.tenantId(), column.columnId(), sourcePk),
-                        Instant.now()
-                )
         );
     }
 
@@ -341,5 +366,4 @@ public class InsertVectorDataService implements InsertVectorDataUseCase {
 
     private record PayloadValues(Map<String, Object> scalarValues, Map<String, Object> qdrantPayload) {
     }
-
 }

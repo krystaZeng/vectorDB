@@ -34,6 +34,10 @@ public class JdbcVectorDataRepository implements VectorDataRelationalPort {
             columns.add(identifier(command.vectorColumn(), "vectorColumn"));
             values.add(command.vectorBytes());
         }
+        if (command.rowVersion() != null) {
+            columns.add(identifier(command.rowVersionColumn(), "rowVersionColumn"));
+            values.add(command.rowVersion());
+        }
         for (Map.Entry<String, Object> entry : command.scalarValues().entrySet()) {
             columns.add(identifier(entry.getKey(), "scalar column"));
             values.add(entry.getValue());
@@ -61,8 +65,77 @@ public class JdbcVectorDataRepository implements VectorDataRelationalPort {
     }
 
     @Override
+    public int update(UpdateRowCommand command) {
+        List<String> assignments = new ArrayList<>();
+        List<Object> values = new ArrayList<>();
+        if (command.vectorBytes() != null) {
+            assignments.add(identifier(command.vectorColumn(), "vectorColumn") + " = ?");
+            values.add(command.vectorBytes());
+        }
+        for (Map.Entry<String, Object> entry : command.scalarValues().entrySet()) {
+            assignments.add(identifier(entry.getKey(), "scalar column") + " = ?");
+            values.add(entry.getValue());
+        }
+        if (command.rowVersionColumn() != null) {
+            String rowVersionColumn = identifier(command.rowVersionColumn(), "rowVersionColumn");
+            if (command.rowVersion() == null) {
+                assignments.add(rowVersionColumn + " = " + rowVersionColumn + " + 1");
+            } else {
+                assignments.add(rowVersionColumn + " = ?");
+                values.add(command.rowVersion());
+            }
+        }
+        if (assignments.isEmpty()) {
+            throw new BizException("update must change at least one column");
+        }
+
+        String sql = "UPDATE "
+                + identifier(command.schemaName(), "schemaName")
+                + "."
+                + identifier(command.tableName(), "tableName")
+                + " SET "
+                + String.join(", ", assignments)
+                + " WHERE "
+                + identifier(command.pkColumn(), "pkColumn")
+                + " = ?";
+        values.add(command.pkValue());
+        try {
+            return jdbcTemplate.update(connection -> {
+                PreparedStatement ps = connection.prepareStatement(sql);
+                bindValues(ps, values);
+                return ps;
+            });
+        } catch (DataAccessException ex) {
+            throw new BizException("failed to update vector row", ex);
+        }
+    }
+
+    @Override
+    public int delete(DeleteRowCommand command) {
+        String sql = "DELETE FROM "
+                + identifier(command.schemaName(), "schemaName")
+                + "."
+                + identifier(command.tableName(), "tableName")
+                + " WHERE "
+                + identifier(command.pkColumn(), "pkColumn")
+                + " = ?";
+        try {
+            return jdbcTemplate.update(connection -> {
+                PreparedStatement ps = connection.prepareStatement(sql);
+                ps.setObject(1, command.pkValue());
+                return ps;
+            });
+        } catch (DataAccessException ex) {
+            throw new BizException("failed to delete vector row", ex);
+        }
+    }
+
+    @Override
     public Optional<VectorRow> findByPk(FindRowCommand command) {
         String vectorColumn = identifier(command.vectorColumn(), "vectorColumn");
+        String rowVersionColumn = command.rowVersionColumn() == null
+                ? null
+                : identifier(command.rowVersionColumn(), "rowVersionColumn");
         List<String> scalarColumns = command.scalarColumns() == null ? List.of() : command.scalarColumns()
                 .stream()
                 .map(column -> identifier(column, "scalar column"))
@@ -70,6 +143,9 @@ public class JdbcVectorDataRepository implements VectorDataRelationalPort {
                 .toList();
         List<String> selectColumns = new ArrayList<>();
         selectColumns.add(vectorColumn);
+        if (rowVersionColumn != null) {
+            selectColumns.add(rowVersionColumn);
+        }
         selectColumns.addAll(scalarColumns);
         String sql = "SELECT "
                 + String.join(", ", selectColumns)
@@ -90,7 +166,12 @@ public class JdbcVectorDataRepository implements VectorDataRelationalPort {
                     for (String scalarColumn : scalarColumns) {
                         scalarValues.put(scalarColumn, rs.getObject(scalarColumn));
                     }
-                    return new VectorRow(rs.getBytes(vectorColumn), scalarValues);
+                    Long rowVersion = null;
+                    if (rowVersionColumn != null) {
+                        Number value = (Number) rs.getObject(rowVersionColumn);
+                        rowVersion = value == null ? null : value.longValue();
+                    }
+                    return new VectorRow(rs.getBytes(vectorColumn), rowVersion, scalarValues);
                 })
                 .stream()
                 .findFirst();

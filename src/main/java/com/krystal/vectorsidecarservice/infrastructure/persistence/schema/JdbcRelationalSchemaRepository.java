@@ -59,6 +59,28 @@ public class JdbcRelationalSchemaRepository implements RelationalSchemaPort {
     }
 
     @Override
+    public boolean columnExists(String schemaName, String tableName, String columnName) {
+        try (Connection connection = dataSource.getConnection()) {
+            DatabaseMetaData metaData = connection.getMetaData();
+            String catalog = connection.getCatalog();
+            TableLookup lookup = tableLookup(metaData, catalog, schemaName, tableName);
+            if (lookup == null) {
+                return false;
+            }
+            try (ResultSet rs = metaData.getColumns(catalog, lookup.schema(), lookup.table(), columnName)) {
+                if (rs.next()) {
+                    return true;
+                }
+            }
+            try (ResultSet rs = metaData.getColumns(catalog, lookup.schema(), lookup.table(), normalizeName(columnName))) {
+                return rs.next();
+            }
+        } catch (SQLException ex) {
+            throw new BizException("failed to check column existence", ex);
+        }
+    }
+
+    @Override
     public void validateTableDefinition(TableDefinition definition) {
         try (Connection connection = dataSource.getConnection()) {
             DatabaseMetaData metaData = connection.getMetaData();

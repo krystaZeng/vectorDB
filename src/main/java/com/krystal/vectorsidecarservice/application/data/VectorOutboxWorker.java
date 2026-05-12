@@ -1,5 +1,7 @@
 package com.krystal.vectorsidecarservice.application.data;
 
+import com.krystal.vectorsidecarservice.application.port.out.RelationalSchemaPort;
+import com.krystal.vectorsidecarservice.application.port.out.IdGeneratorPort;
 import com.krystal.vectorsidecarservice.application.port.out.VectorCollectionPort;
 import com.krystal.vectorsidecarservice.application.port.out.VectorDataRelationalPort;
 import com.krystal.vectorsidecarservice.application.port.out.VectorEngineDataPort;
@@ -14,6 +16,7 @@ import com.krystal.vectorsidecarservice.domain.registry.VectorCollectionMeta;
 import com.krystal.vectorsidecarservice.domain.registry.VectorColumnMeta;
 import com.krystal.vectorsidecarservice.domain.registry.VectorPayloadFieldMeta;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
@@ -29,16 +32,21 @@ import java.util.regex.Pattern;
 
 @Component
 @RequiredArgsConstructor
+@Slf4j
 public class VectorOutboxWorker {
 
     private static final Pattern IDENTIFIER_PATTERN = Pattern.compile("^[A-Za-z][A-Za-z0-9_]*$");
+    private static final String ROW_VERSION_COLUMN = "ROW_VERSION";
+    private static final String SOURCE_VERSION_PAYLOAD_KEY = "_sidecar_source_version";
 
     private final VectorOutboxEventPort vectorOutboxEventPort;
     private final VectorMetadataPort vectorMetadataPort;
     private final VectorCollectionPort vectorCollectionPort;
     private final VectorPayloadFieldPort vectorPayloadFieldPort;
+    private final RelationalSchemaPort relationalSchemaPort;
     private final VectorDataRelationalPort vectorDataRelationalPort;
     private final VectorEngineDataRouter vectorEngineDataRouter;
+    private final IdGeneratorPort idGenerator;
     private final VectorValueEncoder vectorValueEncoder;
     private final VectorPointIdNormalizer pointIdNormalizer;
     private final String workerId = ManagementFactory.getRuntimeMXBean().getName() + "-" + UUID.randomUUID();
@@ -77,7 +85,8 @@ public class VectorOutboxWorker {
         List<VectorOutboxEventMeta> dueEvents = vectorOutboxEventPort.findDue(now, batchSize);
         int processed = 0;
         for (VectorOutboxEventMeta event : dueEvents) {
-            var claimed = vectorOutboxEventPort.claim(event.eventId(), workerId, Instant.now());
+            String claimToken = UUID.randomUUID().toString();
+            var claimed = vectorOutboxEventPort.claim(event.eventId(), workerId, claimToken, Instant.now());
             if (claimed.isPresent()) {
                 processClaimed(claimed.get());
                 processed++;
@@ -88,25 +97,20 @@ public class VectorOutboxWorker {
 
     private void processClaimed(VectorOutboxEventMeta event) {
         try {
-            processUpsert(event);
-            vectorOutboxEventPort.markDone(event.eventId(), Instant.now());
+            long processedSourceVersion = switch (event.eventType()) {
+                case "UPSERT" -> processUpsert(event);
+                case "DELETE" -> processDelete(event);
+                default -> throw new NonRetryableOutboxException("unsupported outbox eventType: " + event.eventType());
+            };
+            markDone(event, processedSourceVersion);
         } catch (NonRetryableOutboxException ex) {
-            vectorOutboxEventPort.markDead(
-                    event.eventId(),
-                    event.retryCount(),
-                    errorCode(ex),
-                    ex.getMessage(),
-                    Instant.now()
-            );
+            markDead(event, event.retryCount(), ex);
         } catch (Exception ex) {
             markRecoverableFailure(event, ex);
         }
     }
 
-    private void processUpsert(VectorOutboxEventMeta event) {
-        if (!"UPSERT".equals(event.eventType())) {
-            throw new NonRetryableOutboxException("unsupported outbox eventType: " + event.eventType());
-        }
+    private long processUpsert(VectorOutboxEventMeta event) {
         VectorColumnMeta column = vectorMetadataPort.findById(event.columnId())
                 .orElseThrow(() -> new NonRetryableOutboxException("vector column metadata not found: " + event.columnId()));
         if (!VectorColumnLifecycle.ACTIVE.status().equals(column.status())) {
@@ -118,6 +122,9 @@ public class VectorOutboxWorker {
                 .map(field -> normalizeIdentifier(field.sourceColumnName(), "payload sourceColumnName"))
                 .distinct()
                 .toList();
+        String rowVersionColumn = relationalSchemaPort.columnExists(column.schemaName(), column.tableName(), ROW_VERSION_COLUMN)
+                ? ROW_VERSION_COLUMN
+                : null;
 
         VectorDataRelationalPort.VectorRow row = vectorDataRelationalPort.findByPk(
                         new VectorDataRelationalPort.FindRowCommand(
@@ -126,6 +133,7 @@ public class VectorOutboxWorker {
                                 column.pkColumn(),
                                 pointIdNormalizer.relationalPkValue(event.sourcePk(), event.pkValueType()),
                                 column.vectorColumn(),
+                                rowVersionColumn,
                                 sourceColumns
                         )
                 )
@@ -135,6 +143,8 @@ public class VectorOutboxWorker {
         }
 
         Map<String, Object> qdrantPayload = qdrantPayload(qdrantPayloadFields, row.scalarValues());
+        long processedSourceVersion = row.rowVersion() == null ? event.sourceVersion() : row.rowVersion();
+        addSourceVersionPayload(qdrantPayload, processedSourceVersion);
         VectorPointIdNormalizer.NormalizedPointId pointId = pointIdNormalizer.normalize(event.pointId(), collection.qdrantIdType());
         String writeTargetName = writeTargetName(collection);
         VectorEngineDataPort.UpsertPointResult result = vectorEngineDataRouter.get(collection.engineType())
@@ -148,6 +158,27 @@ public class VectorOutboxWorker {
         if (result.status() != VectorEngineDataPort.UpsertPointStatus.UPSERTED) {
             throw new BizException(result.message());
         }
+        return processedSourceVersion;
+    }
+
+    private long processDelete(VectorOutboxEventMeta event) {
+        VectorColumnMeta column = vectorMetadataPort.findById(event.columnId())
+                .orElseThrow(() -> new NonRetryableOutboxException("vector column metadata not found: " + event.columnId()));
+        if (!VectorColumnLifecycle.ACTIVE.status().equals(column.status())) {
+            throw new BizException("vector column is not ACTIVE: " + column.columnId());
+        }
+        VectorCollectionMeta collection = readyCollection(column.columnId());
+        VectorPointIdNormalizer.NormalizedPointId pointId = pointIdNormalizer.normalize(event.pointId(), collection.qdrantIdType());
+        String writeTargetName = writeTargetName(collection);
+        VectorEngineDataPort.DeletePointResult result = vectorEngineDataRouter.get(collection.engineType())
+                .deletePoint(new VectorEngineDataPort.DeletePointCommand(
+                        writeTargetName,
+                        pointId.value()
+                ));
+        if (result.status() != VectorEngineDataPort.DeletePointStatus.DELETED) {
+            throw new BizException(result.message());
+        }
+        return event.sourceVersion();
     }
 
     private VectorCollectionMeta readyCollection(long columnId) {
@@ -182,27 +213,150 @@ public class VectorOutboxWorker {
         return payload;
     }
 
+    private void addSourceVersionPayload(Map<String, Object> payload, long sourceVersion) {
+        if (payload.containsKey(SOURCE_VERSION_PAYLOAD_KEY)) {
+            throw new NonRetryableOutboxException("reserved payload key conflicts with sidecar metadata: "
+                    + SOURCE_VERSION_PAYLOAD_KEY);
+        }
+        payload.put(SOURCE_VERSION_PAYLOAD_KEY, sourceVersion);
+    }
+
     private void markRecoverableFailure(VectorOutboxEventMeta event, Exception ex) {
         int nextRetryCount = event.retryCount() + 1;
         Instant now = Instant.now();
         if (nextRetryCount >= maxRetries) {
-            vectorOutboxEventPort.markDead(
-                    event.eventId(),
-                    nextRetryCount,
-                    errorCode(ex),
-                    ex.getMessage(),
-                    now
-            );
+            markDead(event, nextRetryCount, ex);
             return;
         }
-        vectorOutboxEventPort.markRetry(
+        VectorOutboxEventPort.OwnershipUpdateStatus status = vectorOutboxEventPort.markRetry(
                 event.eventId(),
+                event.claimToken(),
+                event.sourceVersion(),
                 nextRetryCount,
                 now.plusMillis(retryDelayMillis(nextRetryCount)),
                 errorCode(ex),
                 ex.getMessage(),
                 now
         );
+        if (status == VectorOutboxEventPort.OwnershipUpdateStatus.STALE_CLAIM) {
+            requestResyncAfterStaleClaim(event);
+        }
+        logStaleClaim(event, status, "markRetry");
+    }
+
+    private void markDone(VectorOutboxEventMeta event, long processedSourceVersion) {
+        VectorOutboxEventPort.OwnershipUpdateStatus status = vectorOutboxEventPort.markDone(
+                event.eventId(),
+                event.claimToken(),
+                processedSourceVersion,
+                Instant.now()
+        );
+        if (status == VectorOutboxEventPort.OwnershipUpdateStatus.STALE_CLAIM) {
+            requestResyncAfterStaleClaim(event);
+        }
+        logStaleClaim(event, status, "markDone");
+    }
+
+    private void requestResyncAfterStaleClaim(VectorOutboxEventMeta event) {
+        Instant now = Instant.now();
+        long eventId = idGenerator.nextId();
+        ResyncPlan resyncPlan = currentResyncPlan(event);
+        VectorOutboxEventMeta resyncEvent = new VectorOutboxEventMeta(
+                eventId,
+                event.tenantId(),
+                event.columnId(),
+                event.eventKey(),
+                event.eventKey(),
+                resyncPlan.eventType(),
+                resyncPlan.sourceOp(),
+                "PENDING",
+                event.sourcePk(),
+                resyncPlan.pointId(),
+                event.pkValueType(),
+                event.eventKey() + ":" + eventId,
+                resyncPlan.sourceVersion(),
+                "N",
+                0,
+                now,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                now,
+                now
+        );
+        VectorOutboxEventPort.SaveResult result = vectorOutboxEventPort.enqueueOrMergeActive(resyncEvent);
+        log.warn(
+                "Requested outbox resync after stale claim: staleEventId={}, resyncEventId={}, created={}",
+                event.eventId(),
+                result.event().eventId(),
+                result.created()
+        );
+    }
+
+    private ResyncPlan currentResyncPlan(VectorOutboxEventMeta event) {
+        try {
+            VectorColumnMeta column = vectorMetadataPort.findById(event.columnId())
+                    .orElseThrow(() -> new NonRetryableOutboxException("vector column metadata not found: " + event.columnId()));
+            String rowVersionColumn = relationalSchemaPort.columnExists(column.schemaName(), column.tableName(), ROW_VERSION_COLUMN)
+                    ? ROW_VERSION_COLUMN
+                    : null;
+            return vectorDataRelationalPort.findByPk(
+                            new VectorDataRelationalPort.FindRowCommand(
+                                    column.schemaName(),
+                                    column.tableName(),
+                                    column.pkColumn(),
+                                    pointIdNormalizer.relationalPkValue(event.sourcePk(), event.pkValueType()),
+                                    column.vectorColumn(),
+                                    rowVersionColumn,
+                                    List.of()
+                            )
+                    )
+                    .map(row -> new ResyncPlan(
+                            "UPSERT",
+                            "UPDATE",
+                            row.rowVersion() == null ? event.sourceVersion() : row.rowVersion(),
+                            event.pointId()
+                    ))
+                    .orElse(new ResyncPlan("DELETE", "DELETE", event.sourceVersion(), event.pointId()));
+        } catch (RuntimeException ex) {
+            log.warn("Failed to build resync plan for stale outbox claim: eventId={}", event.eventId(), ex);
+            return new ResyncPlan(event.eventType(), event.sourceOp(), event.sourceVersion(), event.pointId());
+        }
+    }
+
+    private void markDead(VectorOutboxEventMeta event, int retryCount, Exception ex) {
+        VectorOutboxEventPort.OwnershipUpdateStatus status = vectorOutboxEventPort.markDead(
+                event.eventId(),
+                event.claimToken(),
+                event.sourceVersion(),
+                retryCount,
+                errorCode(ex),
+                ex.getMessage(),
+                Instant.now()
+        );
+        if (status == VectorOutboxEventPort.OwnershipUpdateStatus.STALE_CLAIM) {
+            requestResyncAfterStaleClaim(event);
+        }
+        logStaleClaim(event, status, "markDead");
+    }
+
+    private void logStaleClaim(
+            VectorOutboxEventMeta event,
+            VectorOutboxEventPort.OwnershipUpdateStatus status,
+            String action
+    ) {
+        if (status == VectorOutboxEventPort.OwnershipUpdateStatus.STALE_CLAIM) {
+            log.warn(
+                    "Skip {} for stale outbox claim: eventId={}, workerId={}, claimToken={}",
+                    action,
+                    event.eventId(),
+                    workerId,
+                    event.claimToken()
+            );
+        }
     }
 
     private long retryDelayMillis(int retryCount) {
@@ -245,5 +399,8 @@ public class VectorOutboxWorker {
         NonRetryableOutboxException(String message) {
             super(message);
         }
+    }
+
+    private record ResyncPlan(String eventType, String sourceOp, long sourceVersion, String pointId) {
     }
 }

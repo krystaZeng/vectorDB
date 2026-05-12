@@ -10,6 +10,8 @@ import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.jdbc.Sql;
 import org.springframework.test.web.servlet.MockMvc;
 
+import java.util.List;
+import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -28,6 +30,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
         "DELETE FROM SYS_VECTOR_SYNC_JOBS_",
         "DELETE FROM SYS_VECTOR_PAYLOAD_FIELDS_",
         "DELETE FROM SYS_VECTOR_OUTBOX_EVENTS_",
+        "DELETE FROM SYS_VECTOR_SOURCE_VERSIONS_",
         "DELETE FROM SYS_VECTOR_INDEXES_",
         "DELETE FROM SYS_VECTOR_COLLECTIONS_",
         "DELETE FROM SYS_VECTOR_COLUMNS_"
@@ -188,6 +191,240 @@ class VectorDataControllerIT {
     }
 
     @Test
+    void shouldUpdateRelationalRowAndMergeVectorUpsertOutboxEvent() throws Exception {
+        long columnId = createVectorTable();
+        registerReadyCollection(columnId);
+        registerPayloadField(columnId);
+        insertVectorRow(100, "news", List.of(0.1, 0.2, 0.3));
+
+        String updatePayload = """
+                {
+                  "tenantId": "tenant_insert",
+                  "schemaName": "public",
+                  "tableName": "doc_insert",
+                  "vectorColumn": "embedding",
+                  "pk": 100,
+                  "vector": [0.7, 0.8, 0.9],
+                  "payload": {
+                    "docType": "feature"
+                  }
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/vector-data/update")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(updatePayload))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.columnId").value(columnId))
+                .andExpect(jsonPath("$.data.tableName").value("DOC_INSERT"))
+                .andExpect(jsonPath("$.data.pointId").value("100"))
+                .andExpect(jsonPath("$.data.sourceVersion").value(2))
+                .andExpect(jsonPath("$.data.relationalUpdated").value(true))
+                .andExpect(jsonPath("$.data.vectorSyncEnqueued").value(true))
+                .andExpect(jsonPath("$.data.vectorSyncStatus").value("PENDING_OUTBOX"));
+
+        Map<String, Object> row = jdbcTemplate.queryForMap(
+                "SELECT DOC_TYPE, ROW_VERSION, EMBEDDING FROM PUBLIC.DOC_INSERT WHERE ID = 100"
+        );
+        assertThat(row.get("DOC_TYPE")).isEqualTo("feature");
+        assertThat(((Number) row.get("ROW_VERSION")).longValue()).isEqualTo(2L);
+        assertThat((byte[]) row.get("EMBEDDING")).hasSize(12);
+
+        Map<String, Object> outbox = jdbcTemplate.queryForMap(
+                """
+                        SELECT EVENT_TYPE, SOURCE_OP, SOURCE_VERSION, EVENT_STATUS
+                        FROM SYS_VECTOR_OUTBOX_EVENTS_
+                        WHERE COLUMN_ID = ? AND SOURCE_PK = '100'
+                        """,
+                columnId
+        );
+        assertThat(outbox.get("EVENT_TYPE")).isEqualTo("UPSERT");
+        assertThat(outbox.get("SOURCE_OP")).isEqualTo("UPDATE");
+        assertThat(((Number) outbox.get("SOURCE_VERSION")).longValue()).isEqualTo(2L);
+        assertThat(outbox.get("EVENT_STATUS")).isEqualTo("PENDING");
+
+        Long currentVersion = jdbcTemplate.queryForObject(
+                "SELECT CURRENT_VERSION FROM SYS_VECTOR_SOURCE_VERSIONS_ WHERE COLUMN_ID = ? AND SOURCE_PK = '100'",
+                Long.class,
+                columnId
+        );
+        assertThat(currentVersion).isEqualTo(2L);
+    }
+
+    @Test
+    void shouldDeleteRelationalRowAndMergeVectorDeleteOutboxEvent() throws Exception {
+        long columnId = createVectorTable();
+        registerReadyCollection(columnId);
+        registerPayloadField(columnId);
+        insertVectorRow(104, "delete-me", List.of(0.1, 0.2, 0.3));
+
+        String deletePayload = """
+                {
+                  "tenantId": "tenant_insert",
+                  "schemaName": "public",
+                  "tableName": "doc_insert",
+                  "vectorColumn": "embedding",
+                  "pk": 104
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/vector-data/delete")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(deletePayload))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.columnId").value(columnId))
+                .andExpect(jsonPath("$.data.tableName").value("DOC_INSERT"))
+                .andExpect(jsonPath("$.data.pointId").value("104"))
+                .andExpect(jsonPath("$.data.sourceVersion").value(2))
+                .andExpect(jsonPath("$.data.relationalDeleted").value(true))
+                .andExpect(jsonPath("$.data.vectorSyncEnqueued").value(true))
+                .andExpect(jsonPath("$.data.vectorSyncStatus").value("PENDING_OUTBOX"));
+
+        Integer rowCount = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM PUBLIC.DOC_INSERT WHERE ID = 104",
+                Integer.class
+        );
+        assertThat(rowCount).isZero();
+
+        Map<String, Object> outbox = jdbcTemplate.queryForMap(
+                """
+                        SELECT EVENT_TYPE, SOURCE_OP, SOURCE_VERSION, EVENT_STATUS, ACTIVE_KEY
+                        FROM SYS_VECTOR_OUTBOX_EVENTS_
+                        WHERE COLUMN_ID = ? AND SOURCE_PK = '104'
+                        """,
+                columnId
+        );
+        assertThat(outbox.get("EVENT_TYPE")).isEqualTo("DELETE");
+        assertThat(outbox.get("SOURCE_OP")).isEqualTo("DELETE");
+        assertThat(((Number) outbox.get("SOURCE_VERSION")).longValue()).isEqualTo(2L);
+        assertThat(outbox.get("EVENT_STATUS")).isEqualTo("PENDING");
+        assertThat(outbox.get("ACTIVE_KEY")).isNotNull();
+
+        Long currentVersion = jdbcTemplate.queryForObject(
+                "SELECT CURRENT_VERSION FROM SYS_VECTOR_SOURCE_VERSIONS_ WHERE COLUMN_ID = ? AND SOURCE_PK = '104'",
+                Long.class,
+                columnId
+        );
+        assertThat(currentVersion).isEqualTo(2L);
+    }
+
+    @Test
+    void shouldMergeInsertAfterBusinessDeleteIntoLatestVectorUpsertEvent() throws Exception {
+        long columnId = createVectorTable();
+        registerReadyCollection(columnId);
+        registerPayloadField(columnId);
+        insertVectorRow(202, "first", List.of(0.1, 0.2, 0.3));
+        deleteVectorRow(202);
+
+        insertVectorRow(202, "second", List.of(0.4, 0.5, 0.6));
+
+        Map<String, Object> row = jdbcTemplate.queryForMap(
+                "SELECT DOC_TYPE, ROW_VERSION FROM PUBLIC.DOC_INSERT WHERE ID = 202"
+        );
+        assertThat(row.get("DOC_TYPE")).isEqualTo("second");
+        assertThat(((Number) row.get("ROW_VERSION")).longValue()).isEqualTo(3L);
+
+        Map<String, Object> outbox = jdbcTemplate.queryForMap(
+                """
+                        SELECT EVENT_TYPE, SOURCE_OP, SOURCE_VERSION, EVENT_STATUS
+                        FROM SYS_VECTOR_OUTBOX_EVENTS_
+                        WHERE COLUMN_ID = ? AND SOURCE_PK = '202'
+                        """,
+                columnId
+        );
+        assertThat(outbox.get("EVENT_TYPE")).isEqualTo("UPSERT");
+        assertThat(outbox.get("SOURCE_OP")).isEqualTo("INSERT");
+        assertThat(((Number) outbox.get("SOURCE_VERSION")).longValue()).isEqualTo(3L);
+        assertThat(outbox.get("EVENT_STATUS")).isEqualTo("PENDING");
+
+        Long currentVersion = jdbcTemplate.queryForObject(
+                "SELECT CURRENT_VERSION FROM SYS_VECTOR_SOURCE_VERSIONS_ WHERE COLUMN_ID = ? AND SOURCE_PK = '202'",
+                Long.class,
+                columnId
+        );
+        assertThat(currentVersion).isEqualTo(3L);
+    }
+
+    @Test
+    void shouldKeepSourceVersionMonotonicAfterRowIsDeletedAndReinserted() throws Exception {
+        long columnId = createVectorTable();
+        registerReadyCollection(columnId);
+        registerPayloadField(columnId);
+        insertVectorRow(201, "first", List.of(0.1, 0.2, 0.3));
+
+        int deletedRows = jdbcTemplate.update("DELETE FROM PUBLIC.DOC_INSERT WHERE ID = 201");
+        assertThat(deletedRows).isEqualTo(1);
+
+        insertVectorRow(201, "second", List.of(0.4, 0.5, 0.6));
+
+        Map<String, Object> row = jdbcTemplate.queryForMap(
+                "SELECT DOC_TYPE, ROW_VERSION FROM PUBLIC.DOC_INSERT WHERE ID = 201"
+        );
+        assertThat(row.get("DOC_TYPE")).isEqualTo("second");
+        assertThat(((Number) row.get("ROW_VERSION")).longValue()).isEqualTo(2L);
+
+        Long currentVersion = jdbcTemplate.queryForObject(
+                "SELECT CURRENT_VERSION FROM SYS_VECTOR_SOURCE_VERSIONS_ WHERE COLUMN_ID = ? AND SOURCE_PK = '201'",
+                Long.class,
+                columnId
+        );
+        assertThat(currentVersion).isEqualTo(2L);
+    }
+
+    @Test
+    void shouldRejectUpdateForMissingRow() throws Exception {
+        long columnId = createVectorTable();
+        registerReadyCollection(columnId);
+        registerPayloadField(columnId);
+
+        String updatePayload = """
+                {
+                  "tenantId": "tenant_insert",
+                  "schemaName": "public",
+                  "tableName": "doc_insert",
+                  "vectorColumn": "embedding",
+                  "pk": 999,
+                  "payload": {
+                    "docType": "missing"
+                  }
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/vector-data/update")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(updatePayload))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.message").value("row not found for update: 999"));
+    }
+
+    @Test
+    void shouldRejectDeleteForMissingRow() throws Exception {
+        long columnId = createVectorTable();
+        registerReadyCollection(columnId);
+        registerPayloadField(columnId);
+
+        String deletePayload = """
+                {
+                  "tenantId": "tenant_insert",
+                  "schemaName": "public",
+                  "tableName": "doc_insert",
+                  "vectorColumn": "embedding",
+                  "pk": 999
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/vector-data/delete")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(deletePayload))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.message").value("row not found for delete: 999"));
+    }
+
+    @Test
     void shouldRejectUnknownPayloadKey() throws Exception {
         long columnId = createVectorTable();
         registerReadyCollection(columnId);
@@ -297,6 +534,53 @@ class VectorDataControllerIT {
                         .content(payload))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true));
+    }
+
+    private void insertVectorRow(long pk, String docType, List<Double> vector) throws Exception {
+        String insertPayload = """
+                {
+                  "tenantId": "tenant_insert",
+                  "schemaName": "public",
+                  "tableName": "doc_insert",
+                  "vectorColumn": "embedding",
+                  "pk": %d,
+                  "vector": [%s],
+                  "payload": {
+                    "docType": "%s"
+                  }
+                }
+                """.formatted(pk, vectorCsv(vector), docType);
+
+        mockMvc.perform(post("/api/v1/vector-data/insert")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(insertPayload))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    private void deleteVectorRow(long pk) throws Exception {
+        String deletePayload = """
+                {
+                  "tenantId": "tenant_insert",
+                  "schemaName": "public",
+                  "tableName": "doc_insert",
+                  "vectorColumn": "embedding",
+                  "pk": %d
+                }
+                """.formatted(pk);
+
+        mockMvc.perform(post("/api/v1/vector-data/delete")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(deletePayload))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    private String vectorCsv(List<Double> vector) {
+        return vector.stream()
+                .map(String::valueOf)
+                .reduce((left, right) -> left + ", " + right)
+                .orElse("");
     }
 
     private long getDataLong(String body, String field) {

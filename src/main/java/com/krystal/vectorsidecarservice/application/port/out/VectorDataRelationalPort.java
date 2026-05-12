@@ -8,6 +8,10 @@ public interface VectorDataRelationalPort {
 
     int insert(InsertRowCommand command);
 
+    int update(UpdateRowCommand command);
+
+    int delete(DeleteRowCommand command);
+
     Optional<VectorRow> findByPk(FindRowCommand command);
 
     record InsertRowCommand(
@@ -17,7 +21,30 @@ public interface VectorDataRelationalPort {
             Object pkValue,
             String vectorColumn,
             byte[] vectorBytes,
+            String rowVersionColumn,
+            Long rowVersion,
             Map<String, Object> scalarValues
+    ) {
+    }
+
+    record UpdateRowCommand(
+            String schemaName,
+            String tableName,
+            String pkColumn,
+            Object pkValue,
+            String vectorColumn,
+            byte[] vectorBytes,
+            String rowVersionColumn,
+            Long rowVersion,
+            Map<String, Object> scalarValues
+    ) {
+    }
+
+    record DeleteRowCommand(
+            String schemaName,
+            String tableName,
+            String pkColumn,
+            Object pkValue
     ) {
     }
 
@@ -27,10 +54,11 @@ public interface VectorDataRelationalPort {
             String pkColumn,
             Object pkValue,
             String vectorColumn,
+            String rowVersionColumn,
             List<String> scalarColumns
     ) {
     }
 
-    record VectorRow(byte[] vectorBytes, Map<String, Object> scalarValues) {
+    record VectorRow(byte[] vectorBytes, Long rowVersion, Map<String, Object> scalarValues) {
     }
 }

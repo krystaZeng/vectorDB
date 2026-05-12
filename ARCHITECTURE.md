@@ -37,7 +37,7 @@
 
 ### Data（定义“写入哪一行/哪个 point”）
 
-- 表：`SYS_VECTOR_OUTBOX_EVENTS_`
+- 表：`SYS_VECTOR_OUTBOX_EVENTS_`、`SYS_VECTOR_SOURCE_VERSIONS_`
 - 业务表：由 create table API 创建的用户关系表，向量列在 Altibase 中落为 `VARBYTE(N)`，本地 H2 使用 `VARBINARY(N)`
 - 目录：
   - `domain/data`
@@ -46,9 +46,14 @@
 
 Data 模块的职责：
 
-- `InsertVectorDataService` 负责同步写入关系库业务表。
-- 有 vector 的 insert 在同一个关系库事务内写入 `SYS_VECTOR_OUTBOX_EVENTS_`。
-- `VectorOutboxWorker` 异步消费 outbox，重新读取关系表向量和 payload，并 upsert Qdrant。
+- `InsertVectorDataService` 负责业务 INSERT，重复 PK 由关系库约束拒绝。
+- `UpdateVectorDataService` 负责业务 UPDATE，关系行不存在时失败，不偷偷创建新行。
+- `DeleteVectorDataService` 负责业务 DELETE，关系行不存在时失败，并生成 vector delete tombstone。
+- INSERT / UPDATE 同步到 Qdrant 时统一映射为 `EVENT_TYPE=UPSERT`。
+- DELETE 同步到 Qdrant 时映射为 `EVENT_TYPE=DELETE`。
+- `SYS_VECTOR_SOURCE_VERSIONS_` 负责为同一 `EVENT_KEY` 分配单调 `SOURCE_VERSION`，业务表 `ROW_VERSION` 只是镜像版本。
+- `SYS_VECTOR_OUTBOX_EVENTS_` 负责 active event 合并、worker claim、retry/dead、人工 retry。
+- `VectorOutboxWorker` 异步消费 outbox；UPSERT 重新读取关系表当前行，DELETE 使用 tombstone 删除 Qdrant point。
 - Qdrant 是关系库事实源的派生索引，采用最终一致语义。
 - `VectorPointIdNormalizer` 负责把业务主键稳定映射为 Qdrant point id，保证重复 upsert 幂等。
 - `VectorValueEncoder` 负责关系表向量列的编码/解码，不应散落在 Controller 或 Repository 中。
@@ -70,7 +75,7 @@ Data 模块的职责：
 6. `db/altibase/001_init_sidecar.sql` 补齐 DDL（主键、唯一约束、状态约束、必要索引）
 7. 增加至少一条集成测试覆盖新增 API
 
-## 4. 当前 8 张系统表归属
+## 4. 当前 9 张系统表归属
 
 - Registry：
   - `SYS_VECTOR_COLUMNS_` -> `VectorColumnMeta` / `RegisterVectorColumnService` / `JdbcVectorMetadataRepository`
@@ -83,6 +88,7 @@ Data 模块的职责：
   - `SYS_VECTOR_SYNC_ERRORS_` -> `VectorSyncErrorMeta` / `RecordVectorSyncErrorService` / `JdbcVectorSyncErrorRepository`
 - Data：
   - `SYS_VECTOR_OUTBOX_EVENTS_` -> `VectorOutboxEventMeta` / `ListVectorOutboxEventService` + `VectorOutboxWorker` / `JdbcVectorOutboxEventRepository`
+  - `SYS_VECTOR_SOURCE_VERSIONS_` -> `VectorSourceVersionPort` / `InsertVectorDataService` + `UpdateVectorDataService` + `DeleteVectorDataService` / `JdbcVectorSourceVersionRepository`
 
 业务数据表不属于系统表，但由 Data 模块写入，由 System 模块在 create workflow 中创建。
 
@@ -111,7 +117,23 @@ Data 模块的职责：
 
 DDL 不应假设和系统表元数据注册具备跨数据库原子性。当前通过 `BUILDING + DEFINITION_HASH + 表结构校验` 支持可恢复的半成功流程。
 
-### Insert 链路
+### Data 写入链路
+
+对外业务语义保持 SQL 风格：
+
+- `POST /api/v1/vector-data/insert`
+- `POST /api/v1/vector-data/update`
+- `POST /api/v1/vector-data/delete`
+
+内部同步语义：
+
+- 业务 INSERT -> `EVENT_TYPE=UPSERT` -> Qdrant upsert point
+- 业务 UPDATE -> `EVENT_TYPE=UPSERT` -> Qdrant upsert point
+- 业务 DELETE -> `EVENT_TYPE=DELETE` -> Qdrant delete point
+
+这里的 `UPSERT` 是 vector engine 写入动作，不是对外业务 upsert API。
+
+#### Insert
 
 入口：
 
@@ -130,21 +152,63 @@ insert 支持：
 - worker 至少一次消费 outbox。
 - worker 用稳定 point id upsert Qdrant，重复处理必须安全。
 
+#### Update
+
+入口：
+
+- `POST /api/v1/vector-data/update`
+
+update 支持：
+
+- 只更新 vector。
+- 只更新已注册 payload 标量列。
+- 同时更新 vector 和 payload 标量列。
+
+update 语义是 update-only：
+
+- 关系行不存在时失败。
+- 不会隐式 insert，也不会把对外语义改成业务 upsert。
+- 每次 update 从 `SYS_VECTOR_SOURCE_VERSIONS_` 分配下一版，并写入业务表 `ROW_VERSION`。
+- 如果更新内容需要同步到 Qdrant，则 enqueue/merge `EVENT_TYPE=UPSERT`。
+
+#### Delete
+
+入口：
+
+- `POST /api/v1/vector-data/delete`
+
+delete 语义：
+
+- 关系行不存在时失败。
+- 删除前分配新的 `SOURCE_VERSION`。
+- 同一事务内先 enqueue/merge tombstone outbox，再删除关系行。
+- tombstone 至少保留 `EVENT_TYPE=DELETE`、`SOURCE_OP=DELETE`、`EVENT_KEY`、`SOURCE_VERSION`、`SOURCE_PK`、`POINT_ID`、`PK_VALUE_TYPE`。
+- worker 处理 DELETE 时不重新读取关系表当前行，而是直接按 tombstone 删除 Qdrant point。
+
+如果同一 `EVENT_KEY` 已存在 `DEAD` active event，第一版不自动绕过：业务 delete 返回错误并回滚，避免绕过人工排查流程。
+
 ### Outbox 查询链路
 
 入口：
 
 - `GET /api/v1/vector-outbox-events`
+- `POST /api/v1/vector-outbox-events/{eventId}/retry`
 
-该接口只用于观测事件状态，不应承担重放、修复、删除等状态动作。后续如果需要，应新增显式 action API，例如 retry/dead-letter/replay。
+查询接口用于观测事件状态。人工 retry 是显式 action，只允许将 `DEAD` event 恢复为 `PENDING`，并保留 `ACTIVE_KEY`。
 
 ## 6. 状态与一致性原则
 
 - `SYS_VECTOR_COLUMNS_.STATUS=ACTIVE` 只能表示关系表结构和必需的向量引擎资源已经校验可用。
 - 正常向量写入必须消费 `column=ACTIVE` 且存在 `collection=ACTIVE/READY` 的资源。
 - collection/index 状态应通过 lifecycle service 推进，不应在业务编排中随意拼写状态组合。
-- insert 以关系库为事实源，Qdrant 为最终一致派生索引。
-- outbox worker 是至少一次投递模型，Qdrant upsert 必须以稳定 point id 保持幂等。
+- insert/update/delete 以关系库为事实源，Qdrant 为最终一致派生索引。
+- outbox worker 是至少一次投递模型，Qdrant upsert/delete 必须以稳定 point id 保持幂等。
+- `EVENT_KEY = tenantId + columnId + sourcePk` 表示同一个 logical point。
+- `ACTIVE_KEY` 只约束未解决事件；`DONE` 清空 `ACTIVE_KEY`，`DEAD` 保留 `ACTIVE_KEY`。
+- `SOURCE_VERSION` 由 `SYS_VECTOR_SOURCE_VERSIONS_` 分配，不依赖业务表行生命周期。
+- `PROCESSING` 期间同一 `EVENT_KEY` 发生新变更时，不创建并发 worker，而是更新当前 event 并设置 `NEEDS_RESYNC=Y`。
+- `markDone / markRetry / markDead` 必须使用 `CLAIM_TOKEN + SOURCE_VERSION + NEEDS_RESYNC` 条件，避免旧 worker 覆盖新 worker 状态。
+- worker 已产生 Qdrant 外部副作用后发现 `STALE_CLAIM`，必须按关系库当前行是否存在触发 UPSERT 或 DELETE resync。
 - `PENDING / PROCESSING / DONE / RETRYING / DEAD` 属于 outbox 事件生命周期，后续应收敛为独立 lifecycle/enum，避免散落裸字符串。
 
 ## 7. 演进建议
@@ -152,7 +216,12 @@ insert 支持：
 - 需要跨表编排时，再引入 `application/system` 级别编排服务；单表 CRUD 不要放入 `system` 层。
 - 面向产品化，优先保持“每张表一套职责清晰的垂直链路”，而不是“按功能杂糅”。
 - provisioning 仍是同步编排。若 Qdrant 创建/alias/index 后续变慢，应引入 provisioning operation/outbox，而不是让 Controller 请求长期等待。
-- outbox worker 的状态更新建议增加 `lockedBy/fencing token` 条件，避免锁超时后旧 worker 覆盖新 worker 状态。
+- outbox v2 的状态机已记录在 [OUTBOX_V2_DESIGN.md](OUTBOX_V2_DESIGN.md)，5 月 11 日实现总结见 [0511_vectorDB_update_delete.md](0511_vectorDB_update_delete.md)。
+- 下一步应补 `select` 查询链路：普通关系查询直接读 Altibase，向量检索读 Qdrant 后按 point id 回查关系库组装结果；select 不写 outbox。
 - insert 如需支持客户端安全重试，应增加请求级 `idempotencyKey` 或显式 upsert API。
+- update/delete 如需支持客户端安全重试，也应走请求级 `idempotencyKey`，不要依赖 outbox `ACTIVE_KEY` 充当 API 幂等。
+- 应补 `SYS_VECTOR_SYNC_ATTEMPTS_` 或类似 attempt history 表，保存每次 worker 尝试、错误码和错误信息；outbox 当前表只保留最新状态。
+- worker 需要 heartbeat，降低长时间处理时锁被误判过期的概率。
+- 上线前需要在真实 Altibase 上做 DDL smoke test，尤其确认 `UNIQUE(ACTIVE_KEY)` 允许多个 `NULL` 的行为。
 - 系统表已经超过轻量 MVP，建议引入 Flyway 或 Liquibase 管理版本化 DDL。
 - 需要补充 outbox 指标和告警：pending 数、retrying 数、dead 数、最老 pending 年龄、处理耗时、失败率。

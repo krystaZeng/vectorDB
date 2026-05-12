@@ -165,6 +165,26 @@ public class QdrantVectorEngineAdminAdapter implements VectorEngineAdminPort, Ve
         }
     }
 
+    @Override
+    public DeletePointResult deletePoint(DeletePointCommand command) {
+        if (!enabled) {
+            return DeletePointResult.skippedDisabled("qdrant data write is disabled");
+        }
+        ObjectNode payload = buildDeletePointPayload(command);
+        try {
+            restClient.post()
+                    .uri("/collections/{collection}/points/delete?wait=true", command.collectionName())
+                    .headers(this::applyApiKey)
+                    .header(HttpHeaders.CONTENT_TYPE, "application/json")
+                    .body(payload)
+                    .retrieve()
+                    .toBodilessEntity();
+            return DeletePointResult.deleted("point deleted: " + command.collectionName());
+        } catch (RestClientResponseException ex) {
+            throw new BizException(formatHttpError("deletePoint", ex), ex);
+        }
+    }
+
     private boolean collectionExists(String collectionName) {
         try {
             restClient.get()
@@ -273,6 +293,21 @@ public class QdrantVectorEngineAdminAdapter implements VectorEngineAdminPort, Ve
         putPayload(point, command.payload());
         payload.putArray("points").add(point);
         return payload;
+    }
+
+    private ObjectNode buildDeletePointPayload(DeletePointCommand command) {
+        ObjectNode payload = objectMapper.createObjectNode();
+        var points = payload.putArray("points");
+        Object pointId = command.pointId();
+        if (pointId instanceof Number number) {
+            points.add(number.longValue());
+            return payload;
+        }
+        if (pointId instanceof String text && !text.isBlank()) {
+            points.add(text);
+            return payload;
+        }
+        throw new BizException("qdrant point id must be a number or string");
     }
 
     private void putPointId(ObjectNode point, Object pointId) {

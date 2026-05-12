@@ -10,6 +10,8 @@ public interface RelationalSchemaPort {
 
     boolean tableExists(String schemaName, String tableName);
 
+    boolean columnExists(String schemaName, String tableName, String columnName);
+
     void validateTableDefinition(TableDefinition definition);
 
     void executeDdl(String ddl);

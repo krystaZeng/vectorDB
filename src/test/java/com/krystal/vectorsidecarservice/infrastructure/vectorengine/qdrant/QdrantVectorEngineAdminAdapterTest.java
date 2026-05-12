@@ -127,6 +127,24 @@ class QdrantVectorEngineAdminAdapterTest {
         server.verify();
     }
 
+    @Test
+    void shouldDeletePoint() {
+        server.expect(requestTo("http://qdrant.test/collections/doc_active/points/delete?wait=true"))
+                .andExpect(method(HttpMethod.POST))
+                .andExpect(content().string(containsString("\"points\":[123]")))
+                .andRespond(withSuccess("{\"status\":\"ok\",\"result\":{\"operation_id\":2}}", MediaType.APPLICATION_JSON));
+
+        VectorEngineDataPort.DeletePointResult result = adapter().deletePoint(
+                new VectorEngineDataPort.DeletePointCommand(
+                        "doc_active",
+                        123L
+                )
+        );
+
+        assertThat(result.status()).isEqualTo(VectorEngineDataPort.DeletePointStatus.DELETED);
+        server.verify();
+    }
+
     private QdrantVectorEngineAdminAdapter adapter() {
         return new QdrantVectorEngineAdminAdapter(
                 new ObjectMapper(),

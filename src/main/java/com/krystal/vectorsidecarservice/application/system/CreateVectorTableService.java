@@ -39,6 +39,7 @@ import java.util.regex.Pattern;
 @Slf4j
 public class CreateVectorTableService implements CreateVectorTableUseCase {
 
+    private static final String ROW_VERSION_COLUMN = AltibaseCreateTableSqlBuilder.ROW_VERSION_COLUMN;
     private static final String DEFAULT_SCHEMA = "PUBLIC";
     private static final String DEFAULT_ENGINE_TYPE = "QDRANT";
     private static final String DEFAULT_TENANT = "DEFAULT";
@@ -545,6 +546,7 @@ public class CreateVectorTableService implements CreateVectorTableUseCase {
     ) {
         List<RelationalSchemaPort.ColumnDefinition> columns = new ArrayList<>();
         columns.add(new RelationalSchemaPort.ColumnDefinition(primaryKey.name(), scalarType(primaryKey.type()), scalarLength(primaryKey.type(), null), false));
+        columns.add(new RelationalSchemaPort.ColumnDefinition(ROW_VERSION_COLUMN, "BIGINT", null, false));
         for (ScalarColumnSpec scalarColumn : scalarColumns) {
             columns.add(new RelationalSchemaPort.ColumnDefinition(
                     scalarColumn.name(),
@@ -923,6 +925,7 @@ public class CreateVectorTableService implements CreateVectorTableUseCase {
     ) {
         Set<String> names = new HashSet<>();
         checkDuplicate(names, primaryKey.name(), "primaryKey.name");
+        checkDuplicate(names, ROW_VERSION_COLUMN, "system.rowVersion");
         for (ScalarColumnSpec scalarColumn : scalarColumns) {
             checkDuplicate(names, scalarColumn.name(), "scalarColumns.name");
         }
