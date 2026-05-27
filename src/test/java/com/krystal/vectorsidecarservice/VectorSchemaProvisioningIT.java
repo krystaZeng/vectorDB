@@ -260,6 +260,16 @@ class VectorSchemaProvisioningIT {
         }
 
         @Override
+        public EnsureResult verifyCollection(VerifyCollectionCommand command) {
+            return EnsureResult.alreadyExists("collection config matches");
+        }
+
+        @Override
+        public EnsureResult verifyAlias(VerifyAliasCommand command) {
+            return EnsureResult.alreadyExists("alias points to collection");
+        }
+
+        @Override
         public EnsureResult ensureAlias(EnsureAliasCommand command) {
             return EnsureResult.created("alias created");
         }

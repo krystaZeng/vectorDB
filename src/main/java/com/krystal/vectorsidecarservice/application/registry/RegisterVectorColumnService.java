@@ -2,6 +2,7 @@ package com.krystal.vectorsidecarservice.application.registry;
 
 import com.krystal.vectorsidecarservice.application.port.in.RegisterVectorColumnUseCase;
 import com.krystal.vectorsidecarservice.application.port.out.IdGeneratorPort;
+import com.krystal.vectorsidecarservice.application.port.out.RelationalSchemaPort;
 import com.krystal.vectorsidecarservice.application.port.out.VectorMetadataPort;
 import com.krystal.vectorsidecarservice.application.registry.lifecycle.VectorColumnLifecycle;
 import com.krystal.vectorsidecarservice.common.exception.BizException;
@@ -16,6 +17,7 @@ import java.time.Instant;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
+import java.util.regex.Pattern;
 
 @Service
 @RequiredArgsConstructor
@@ -26,14 +28,19 @@ public class RegisterVectorColumnService implements RegisterVectorColumnUseCase 
     private static final String DEFAULT_METRIC_TYPE = "COSINE";
     private static final String DEFAULT_VECTOR_ENCODING = "FLOAT32_LE";
     private static final String DEFAULT_SYNC_MODE = "FULL_AND_INCREMENTAL";
-    private static final String DEFAULT_STATUS = "ACTIVE";
+    private static final String DEFAULT_STATUS = "BUILDING";
     private static final int MAX_REMARK_LEN = 1024;
+    private static final Pattern IDENTIFIER_PATTERN = Pattern.compile("^[A-Za-z][A-Za-z0-9_]*$");
 
     private final VectorMetadataPort vectorMetadataPort;
+    private final RelationalSchemaPort relationalSchemaPort;
     private final IdGeneratorPort idGenerator;
 
     @Override
     public VectorColumnMeta register(RegisterVectorColumnCommand command) {
+        if (command == null) {
+            throw new BizException("request must not be null");
+        }
         if (command.dimension() <= 0) {
             throw new BizException("dimension must be greater than 0");
         }
@@ -41,11 +48,15 @@ public class RegisterVectorColumnService implements RegisterVectorColumnUseCase 
         String vectorEncoding = normalizeVectorEncoding(command.vectorEncoding());
         String syncMode = normalizeSyncMode(command.syncMode());
         String tenantId = normalizeWithDefault(command.tenantId(), DEFAULT_TENANT);
-        String schemaName = normalizeWithDefault(command.schemaName(), DEFAULT_SCHEMA);
-        String tableName = trimRequired(command.tableName(), "tableName").toUpperCase(Locale.ROOT);
-        String pkColumn = trimRequired(command.pkColumn(), "pkColumn").toUpperCase(Locale.ROOT);
-        String vectorColumn = trimRequired(command.vectorColumn(), "vectorColumn").toUpperCase(Locale.ROOT);
-        String status = normalizeStatus(command.status());
+        String schemaName = normalizeIdentifier(command.schemaName(), "schemaName", DEFAULT_SCHEMA);
+        String tableName = normalizeIdentifier(command.tableName(), "tableName", null);
+        String pkColumn = normalizeIdentifier(command.pkColumn(), "pkColumn", null);
+        String vectorColumn = normalizeIdentifier(command.vectorColumn(), "vectorColumn", null);
+        boolean manualRegistration = Boolean.TRUE.equals(command.validateRelationalShape());
+        if (manualRegistration) {
+            validateRelationalShape(schemaName, tableName, pkColumn, vectorColumn);
+        }
+        String status = normalizeRegisterStatus(command.status(), manualRegistration);
         String definitionHash = normalizeDefinitionHash(command.definitionHash(), tenantId, schemaName, tableName,
                 pkColumn, vectorColumn, command.dimension(), metricType, vectorEncoding, syncMode);
         Instant now = Instant.now();
@@ -75,11 +86,27 @@ public class RegisterVectorColumnService implements RegisterVectorColumnUseCase 
         return vectorMetadataPort.findAll();
     }
 
-    private String trimRequired(String value, String fieldName) {
-        if (value == null || value.isBlank()) {
+    private String normalizeIdentifier(String value, String fieldName, String defaultValue) {
+        String normalized = normalizeWithDefault(value, defaultValue);
+        if (normalized == null) {
             throw new BizException(fieldName + " must not be blank");
         }
-        return value.trim();
+        if (!IDENTIFIER_PATTERN.matcher(normalized).matches()) {
+            throw new BizException(fieldName + " must match [A-Za-z][A-Za-z0-9_]*");
+        }
+        return normalized;
+    }
+
+    private void validateRelationalShape(String schemaName, String tableName, String pkColumn, String vectorColumn) {
+        if (!relationalSchemaPort.tableExists(schemaName, tableName)) {
+            throw new BizException("table does not exist: " + schemaName + "." + tableName);
+        }
+        if (!relationalSchemaPort.columnExists(schemaName, tableName, pkColumn)) {
+            throw new BizException("pk column does not exist: " + schemaName + "." + tableName + "." + pkColumn);
+        }
+        if (!relationalSchemaPort.columnExists(schemaName, tableName, vectorColumn)) {
+            throw new BizException("vector column does not exist: " + schemaName + "." + tableName + "." + vectorColumn);
+        }
     }
 
     private String normalizeMetricType(String metricType) {
@@ -106,9 +133,16 @@ public class RegisterVectorColumnService implements RegisterVectorColumnUseCase 
         return normalized;
     }
 
-    private String normalizeStatus(String status) {
-        String normalized = normalizeWithDefault(status, DEFAULT_STATUS);
-        return VectorColumnLifecycle.normalize(normalized).status();
+    private String normalizeRegisterStatus(String status, boolean manualRegistration) {
+        String normalized = normalizeWithDefault(status, manualRegistration ? DEFAULT_STATUS : "ACTIVE");
+        VectorColumnLifecycle lifecycle = VectorColumnLifecycle.normalize(normalized);
+        if (manualRegistration && lifecycle == VectorColumnLifecycle.ACTIVE) {
+            throw new BizException("manual vector column registration cannot create ACTIVE column; use verify-and-activate");
+        }
+        if (manualRegistration && lifecycle == VectorColumnLifecycle.FAILED) {
+            throw new BizException("manual vector column registration cannot create FAILED column");
+        }
+        return lifecycle.status();
     }
 
     private String normalizeDefinitionHash(

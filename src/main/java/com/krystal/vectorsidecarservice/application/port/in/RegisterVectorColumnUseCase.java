@@ -22,8 +22,40 @@ public interface RegisterVectorColumnUseCase {
             String syncMode,
             String status,
             String definitionHash,
-            String remark
+            String remark,
+            Boolean validateRelationalShape
     ) {
+        public RegisterVectorColumnCommand(
+                String tenantId,
+                String schemaName,
+                String tableName,
+                String pkColumn,
+                String vectorColumn,
+                int dimension,
+                String metricType,
+                String vectorEncoding,
+                String syncMode,
+                String status,
+                String definitionHash,
+                String remark
+        ) {
+            this(
+                    tenantId,
+                    schemaName,
+                    tableName,
+                    pkColumn,
+                    vectorColumn,
+                    dimension,
+                    metricType,
+                    vectorEncoding,
+                    syncMode,
+                    status,
+                    definitionHash,
+                    remark,
+                    false
+            );
+        }
+
         public RegisterVectorColumnCommand(
                 String tenantId,
                 String schemaName,
@@ -49,7 +81,8 @@ public interface RegisterVectorColumnUseCase {
                     syncMode,
                     status,
                     definitionHash,
-                    remark
+                    remark,
+                    false
             );
         }
     }

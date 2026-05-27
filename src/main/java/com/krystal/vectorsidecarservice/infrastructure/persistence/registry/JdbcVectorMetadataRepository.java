@@ -13,6 +13,7 @@ import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 
 @Repository
 @RequiredArgsConstructor
@@ -199,6 +200,29 @@ public class JdbcVectorMetadataRepository implements VectorMetadataPort {
     @Override
     public void updateStatus(long columnId, String status, String remark) {
         jdbcTemplate.update(UPDATE_STATUS_SQL, status, remark, columnId);
+    }
+
+    @Override
+    public int updateStatusIfCurrentIn(long columnId, String status, String remark, Set<String> currentStatuses) {
+        if (currentStatuses == null || currentStatuses.isEmpty()) {
+            throw new BizException("currentStatuses must not be empty");
+        }
+        String placeholders = String.join(", ", currentStatuses.stream().map(ignored -> "?").toList());
+        String sql = """
+                UPDATE SYS_VECTOR_COLUMNS_
+                SET STATUS = ?, REMARK = ?, UPDATED_AT = CURRENT_TIMESTAMP
+                WHERE COLUMN_ID = ?
+                  AND STATUS IN (
+                """ + placeholders + ")";
+        Object[] args = new Object[3 + currentStatuses.size()];
+        args[0] = status;
+        args[1] = remark;
+        args[2] = columnId;
+        int index = 3;
+        for (String currentStatus : currentStatuses) {
+            args[index++] = currentStatus;
+        }
+        return jdbcTemplate.update(sql, args);
     }
 
     private VectorColumnMeta mapRow(ResultSet rs, int rowNum) throws SQLException {

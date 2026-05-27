@@ -5,6 +5,7 @@ import com.krystal.vectorsidecarservice.application.port.out.IdGeneratorPort;
 import com.krystal.vectorsidecarservice.application.port.out.VectorCollectionPort;
 import com.krystal.vectorsidecarservice.application.registry.lifecycle.VectorCollectionLifecycle;
 import com.krystal.vectorsidecarservice.application.support.FieldValidator;
+import com.krystal.vectorsidecarservice.application.support.VectorCollectionReadinessVerifier;
 import com.krystal.vectorsidecarservice.application.support.VectorMetadataReferenceGuard;
 import com.krystal.vectorsidecarservice.common.exception.BizException;
 import com.krystal.vectorsidecarservice.domain.registry.VectorColumnMeta;
@@ -27,6 +28,7 @@ public class RegisterVectorCollectionService implements RegisterVectorCollection
     private final VectorCollectionPort vectorCollectionPort;
     private final IdGeneratorPort idGenerator;
     private final VectorMetadataReferenceGuard referenceGuard;
+    private final VectorCollectionReadinessVerifier collectionReadinessVerifier;
 
     @Override
     public VectorCollectionMeta register(RegisterVectorCollectionCommand command) {
@@ -83,6 +85,9 @@ public class RegisterVectorCollectionService implements RegisterVectorCollection
                 now,
                 now
         );
+        if ("READY".equals(meta.collectionStatus())) {
+            collectionReadinessVerifier.verifyOrThrow(meta);
+        }
         return vectorCollectionPort.save(meta);
     }
 

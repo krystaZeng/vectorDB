@@ -199,6 +199,29 @@ class VectorOutboxWorkerIT {
     }
 
     @Test
+    void shouldMarkDirtyUpsertOutboxDeadWhenSourceVectorIsMissing() throws Exception {
+        long columnId = createVectorTable();
+        registerReadyCollection(columnId);
+        registerPayloadField(columnId);
+        insertScalarOnlyRow(201);
+        long eventId = enqueueDirtyUpsertEvent(columnId, 201);
+
+        int processed = vectorOutboxWorker.drainOnce(10);
+
+        assertThat(processed).isEqualTo(1);
+        Map<String, Object> row = jdbcTemplate.queryForMap(
+                "SELECT EVENT_STATUS, ERROR_CODE, ERROR_MESSAGE, ACTIVE_KEY FROM SYS_VECTOR_OUTBOX_EVENTS_ WHERE EVENT_ID = ?",
+                eventId
+        );
+        assertThat(row.get("EVENT_STATUS")).isEqualTo("DEAD");
+        assertThat(row.get("ERROR_CODE")).isEqualTo("VECTOR_MISSING");
+        assertThat(row.get("ERROR_MESSAGE")).asString().contains("source row vector is empty: 201");
+        assertThat(row.get("ACTIVE_KEY")).isEqualTo("TENANT_OUTBOX:" + columnId + ":201");
+        assertThat(testVectorEngineDataPort.lastCommand()).isNull();
+        assertThat(testVectorEngineDataPort.lastDeleteCommand()).isNull();
+    }
+
+    @Test
     void shouldRejectStaleClaimWhenPreviousWorkerMarksDoneAfterLockExpired() throws Exception {
         long columnId = createVectorTable();
         registerReadyCollection(columnId);
@@ -695,11 +718,66 @@ class VectorOutboxWorkerIT {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true))
                 .andExpect(jsonPath("$.data.sourceVersion").value(2))
-                .andExpect(jsonPath("$.data.vectorSyncStatus").value("PENDING_OUTBOX"))
+                .andExpect(jsonPath("$.data.vectorSyncStatus").value("VECTOR_SYNC_ENQUEUED"))
                 .andReturn()
                 .getResponse()
                 .getContentAsString();
         return getDataLong(responseBody, "outboxEventId");
+    }
+
+    private void insertScalarOnlyRow(long pk) throws Exception {
+        String insertPayload = """
+                {
+                  "tenantId": "tenant_outbox",
+                  "schemaName": "public",
+                  "tableName": "doc_outbox",
+                  "pk": %d,
+                  "payload": {
+                    "docType": "draft"
+                  }
+                }
+                """.formatted(pk);
+
+        mockMvc.perform(post("/api/v1/vector-data/insert")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(insertPayload))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.vectorInserted").value(false));
+    }
+
+    private long enqueueDirtyUpsertEvent(long columnId, long pk) {
+        Long eventId = jdbcTemplate.queryForObject("SELECT NEXT VALUE FOR SYS_VECTOR_ID_SEQ", Long.class);
+        Instant now = Instant.now();
+        String sourcePk = String.valueOf(pk);
+        String eventKey = "TENANT_OUTBOX:" + columnId + ":" + sourcePk;
+        VectorOutboxEventMeta event = new VectorOutboxEventMeta(
+                eventId,
+                "TENANT_OUTBOX",
+                columnId,
+                eventKey,
+                eventKey,
+                "UPSERT",
+                "UPDATE",
+                "PENDING",
+                sourcePk,
+                sourcePk,
+                "NUMBER",
+                eventKey + ":" + eventId,
+                1,
+                "N",
+                0,
+                now,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                now,
+                now
+        );
+        return vectorOutboxEventPort.enqueueOrMergeActive(event).event().eventId();
     }
 
     private void deleteVectorRow() throws Exception {

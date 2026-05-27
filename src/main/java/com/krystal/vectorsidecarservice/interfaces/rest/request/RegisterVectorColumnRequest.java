@@ -12,6 +12,7 @@ public record RegisterVectorColumnRequest(
         @Min(1) int dimension,
         String metricType,
         String vectorEncoding,
-        String syncMode
+        String syncMode,
+        String status
 ) {
 }

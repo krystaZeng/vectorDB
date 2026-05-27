@@ -6,6 +6,10 @@ public interface VectorEngineAdminPort {
 
     EnsureResult ensureCollection(EnsureCollectionCommand command);
 
+    EnsureResult verifyCollection(VerifyCollectionCommand command);
+
+    EnsureResult verifyAlias(VerifyAliasCommand command);
+
     EnsureResult ensureAlias(EnsureAliasCommand command);
 
     EnsureResult ensureIndex(EnsureIndexCommand command);
@@ -54,6 +58,20 @@ public interface VectorEngineAdminPort {
             String hnswConfigJson,
             String quantizationConfigJson,
             String collectionConfigJson
+    ) {
+    }
+
+    record VerifyCollectionCommand(
+            String collectionName,
+            int vectorDim,
+            String distanceMetric,
+            String qdrantVectorName
+    ) {
+    }
+
+    record VerifyAliasCommand(
+            String aliasName,
+            String collectionName
     ) {
     }
 

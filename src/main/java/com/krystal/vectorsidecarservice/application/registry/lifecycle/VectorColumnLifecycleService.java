@@ -7,9 +7,13 @@ import com.krystal.vectorsidecarservice.domain.registry.VectorColumnMeta;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 
+import java.util.Set;
+
 @Service
 @RequiredArgsConstructor
 public class VectorColumnLifecycleService {
+
+    private static final int MAX_REMARK_LEN = 1024;
 
     private final VectorMetadataPort vectorMetadataPort;
 
@@ -21,8 +25,28 @@ public class VectorColumnLifecycleService {
         mark(columnId, VectorColumnLifecycle.ACTIVE, null);
     }
 
+    public boolean markActiveIfCurrentIn(long columnId, Set<String> currentStatuses) {
+        FieldValidator.requirePositive(columnId, "columnId");
+        return vectorMetadataPort.updateStatusIfCurrentIn(
+                columnId,
+                VectorColumnLifecycle.ACTIVE.status(),
+                null,
+                currentStatuses
+        ) == 1;
+    }
+
     public void markFailed(long columnId, String remark) {
         mark(columnId, VectorColumnLifecycle.FAILED, remark);
+    }
+
+    public boolean markFailedIfCurrentIn(long columnId, String remark, Set<String> currentStatuses) {
+        FieldValidator.requirePositive(columnId, "columnId");
+        return vectorMetadataPort.updateStatusIfCurrentIn(
+                columnId,
+                VectorColumnLifecycle.FAILED.status(),
+                truncateRemark(remark),
+                currentStatuses
+        ) == 1;
     }
 
     public void markDisabled(long columnId, String remark) {
@@ -42,5 +66,13 @@ public class VectorColumnLifecycleService {
                     + current.status() + " -> " + target.status());
         }
         vectorMetadataPort.updateStatus(columnId, target.status(), remark);
+    }
+
+    private String truncateRemark(String remark) {
+        if (remark == null || remark.isBlank()) {
+            return "readiness verification failed";
+        }
+        String normalized = remark.trim();
+        return normalized.length() <= MAX_REMARK_LEN ? normalized : normalized.substring(0, MAX_REMARK_LEN);
     }
 }

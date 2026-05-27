@@ -28,6 +28,8 @@
     </scm>
     <properties>
         <java.version>17</java.version>
+        <failsafe.groups></failsafe.groups>
+        <failsafe.excludedGroups>real-e2e</failsafe.excludedGroups>
     </properties>
 
     <dependencies>
@@ -113,6 +115,8 @@
                     <includes>
                         <include>**/*IT.java</include>
                     </includes>
+                    <groups>${failsafe.groups}</groups>
+                    <excludedGroups>${failsafe.excludedGroups}</excludedGroups>
                 </configuration>
                 <executions>
                     <execution>
@@ -125,5 +129,15 @@
             </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <profile>
+            <id>real-e2e</id>
+            <properties>
+                <failsafe.groups>real-e2e</failsafe.groups>
+                <failsafe.excludedGroups></failsafe.excludedGroups>
+            </properties>
+        </profile>
+    </profiles>
 
 </project>

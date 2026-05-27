@@ -14,6 +14,7 @@ import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 import tools.jackson.databind.node.ObjectNode;
 
+import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
@@ -63,8 +64,18 @@ public class QdrantVectorEngineAdminAdapter implements VectorEngineAdminPort, Ve
         if (!enabled) {
             return EnsureResult.skippedDisabled("qdrant provisioning is disabled");
         }
-        if (collectionExists(command.collectionName())) {
-            return EnsureResult.alreadyExists("collection already exists: " + command.collectionName());
+        Optional<QdrantCollectionConfig> existing = findCollectionConfig(command.collectionName());
+        if (existing.isPresent()) {
+            validateCollectionConfig(
+                    command.collectionName(),
+                    command.vectorDim(),
+                    command.distanceMetric(),
+                    command.qdrantVectorName(),
+                    existing.get()
+            );
+            return EnsureResult.alreadyExists(
+                    "collection already exists and config matches: " + command.collectionName()
+            );
         }
 
         ObjectNode payload = buildCollectionPayload(command);
@@ -79,10 +90,52 @@ public class QdrantVectorEngineAdminAdapter implements VectorEngineAdminPort, Ve
             return EnsureResult.created("collection created: " + command.collectionName());
         } catch (RestClientResponseException ex) {
             if (ex.getStatusCode().value() == 409) {
-                return EnsureResult.alreadyExists("collection already exists: " + command.collectionName());
+                QdrantCollectionConfig config = findCollectionConfig(command.collectionName())
+                        .orElseThrow(() -> new BizException("qdrant collection exists but config cannot be resolved: "
+                                + command.collectionName()));
+                validateCollectionConfig(
+                        command.collectionName(),
+                        command.vectorDim(),
+                        command.distanceMetric(),
+                        command.qdrantVectorName(),
+                        config
+                );
+                return EnsureResult.alreadyExists(
+                        "collection already exists and config matches: " + command.collectionName()
+                );
             }
             throw new BizException(formatHttpError("ensureCollection", ex), ex);
         }
+    }
+
+    @Override
+    public EnsureResult verifyCollection(VerifyCollectionCommand command) {
+        if (!enabled) {
+            return EnsureResult.skippedDisabled("qdrant readiness validation is disabled");
+        }
+        QdrantCollectionConfig config = findCollectionConfig(command.collectionName())
+                .orElseThrow(() -> new BizException("qdrant collection not found: " + command.collectionName()));
+        validateCollectionConfig(
+                command.collectionName(),
+                command.vectorDim(),
+                command.distanceMetric(),
+                command.qdrantVectorName(),
+                config
+        );
+        return EnsureResult.alreadyExists("collection config matches: " + command.collectionName());
+    }
+
+    @Override
+    public EnsureResult verifyAlias(VerifyAliasCommand command) {
+        if (!enabled) {
+            return EnsureResult.skippedDisabled("qdrant alias readiness validation is disabled");
+        }
+        if (command.aliasName() == null || command.aliasName().isBlank()) {
+            return EnsureResult.skippedNoop("alias is blank, skipping");
+        }
+        String target = findAliasTarget(command.aliasName())
+                .orElseThrow(() -> new BizException("qdrant alias not found: " + command.aliasName()));
+        return ensureAliasPointsToExpectedCollection(command.aliasName(), command.collectionName(), target);
     }
 
     @Override
@@ -185,17 +238,20 @@ public class QdrantVectorEngineAdminAdapter implements VectorEngineAdminPort, Ve
         }
     }
 
-    private boolean collectionExists(String collectionName) {
+    private Optional<QdrantCollectionConfig> findCollectionConfig(String collectionName) {
         try {
-            restClient.get()
+            JsonNode response = restClient.get()
                     .uri("/collections/{collection}", collectionName)
                     .headers(this::applyApiKey)
                     .retrieve()
-                    .toBodilessEntity();
-            return true;
+                    .body(JsonNode.class);
+            if (response == null) {
+                throw new BizException("qdrant collection lookup returned empty response: " + collectionName);
+            }
+            return Optional.of(parseCollectionConfig(collectionName, response));
         } catch (RestClientResponseException ex) {
             if (ex.getStatusCode().isSameCodeAs(HttpStatusCode.valueOf(404))) {
-                return false;
+                return Optional.empty();
             }
             throw new BizException(formatHttpError("collectionLookup", ex), ex);
         }
@@ -246,6 +302,107 @@ public class QdrantVectorEngineAdminAdapter implements VectorEngineAdminPort, Ve
                 .body(payload)
                 .retrieve()
                 .toBodilessEntity();
+    }
+
+    private QdrantCollectionConfig parseCollectionConfig(String collectionName, JsonNode response) {
+        JsonNode vectors = response.path("result").path("config").path("params").path("vectors");
+        if (!vectors.isObject()) {
+            throw new BizException("qdrant collection vectors config is invalid: " + collectionName);
+        }
+
+        if (vectors.has("size") || vectors.has("distance")) {
+            return new QdrantCollectionConfig(parseVectorConfig(collectionName, "unnamed", vectors), Map.of());
+        }
+
+        Map<String, VectorConfig> namedVectors = new LinkedHashMap<>();
+        for (Map.Entry<String, JsonNode> entry : vectors.properties()) {
+            if (!entry.getValue().isObject()) {
+                throw new BizException("qdrant named vector config is invalid: "
+                        + collectionName + "." + entry.getKey());
+            }
+            namedVectors.put(entry.getKey(), parseVectorConfig(collectionName, entry.getKey(), entry.getValue()));
+        }
+        if (namedVectors.isEmpty()) {
+            throw new BizException("qdrant collection vectors config is empty: " + collectionName);
+        }
+        return new QdrantCollectionConfig(null, Map.copyOf(namedVectors));
+    }
+
+    private VectorConfig parseVectorConfig(String collectionName, String vectorName, JsonNode vectorConfig) {
+        JsonNode size = vectorConfig.path("size");
+        if (!size.canConvertToInt()) {
+            throw new BizException("qdrant vector size is invalid: " + collectionName + "." + vectorName);
+        }
+        String distance = vectorConfig.path("distance").asString(null);
+        if (distance == null || distance.isBlank()) {
+            throw new BizException("qdrant vector distance is invalid: " + collectionName + "." + vectorName);
+        }
+        return new VectorConfig(size.asInt(), distance.trim());
+    }
+
+    private void validateCollectionConfig(
+            String collectionName,
+            int expectedDim,
+            String expectedDistanceMetric,
+            String expectedVectorName,
+            QdrantCollectionConfig actual
+    ) {
+        VectorConfig actualVector = resolveExpectedVector(collectionName, expectedVectorName, actual);
+        if (actualVector.size() != expectedDim) {
+            throw new BizException("qdrant collection vector dimension mismatch: collection="
+                    + collectionName
+                    + ", expected=" + expectedDim
+                    + ", actual=" + actualVector.size());
+        }
+
+        String expectedDistance = normalizeDistanceMetric(expectedDistanceMetric);
+        String actualDistance = normalizeDistanceMetric(actualVector.distance());
+        if (!expectedDistance.equals(actualDistance)) {
+            throw new BizException("qdrant collection distance mismatch: collection="
+                    + collectionName
+                    + ", expected=" + expectedDistance
+                    + ", actual=" + actualDistance);
+        }
+    }
+
+    private VectorConfig resolveExpectedVector(
+            String collectionName,
+            String expectedVectorName,
+            QdrantCollectionConfig actual
+    ) {
+        if (expectsUnnamedVector(expectedVectorName)) {
+            if (actual.unnamedVector() != null) {
+                return actual.unnamedVector();
+            }
+            throw new BizException("qdrant collection vector mode mismatch: collection="
+                    + collectionName
+                    + ", expected unnamed vector, actual named vectors="
+                    + actual.namedVectors().keySet());
+        }
+
+        String vectorName = expectedVectorName.trim();
+        VectorConfig namedVector = actual.namedVectors().get(vectorName);
+        if (namedVector != null) {
+            return namedVector;
+        }
+        if (actual.unnamedVector() != null) {
+            throw new BizException("qdrant collection vector mode mismatch: collection="
+                    + collectionName
+                    + ", expected named vector=" + vectorName
+                    + ", actual unnamed vector");
+        }
+        throw new BizException("qdrant named vector not found: collection="
+                + collectionName
+                + ", vectorName=" + vectorName
+                + ", actual named vectors=" + actual.namedVectors().keySet());
+    }
+
+    private boolean expectsUnnamedVector(String qdrantVectorName) {
+        // In this system, null/blank/default means Qdrant unnamed vector.
+        // A Qdrant named vector literally called "default" is not supported by this path.
+        return qdrantVectorName == null
+                || qdrantVectorName.isBlank()
+                || "default".equalsIgnoreCase(qdrantVectorName.trim());
     }
 
     private EnsureResult ensureAliasPointsToExpectedCollection(
@@ -394,10 +551,22 @@ public class QdrantVectorEngineAdminAdapter implements VectorEngineAdminPort, Ve
     }
 
     private String toQdrantDistance(String metric) {
-        return switch (metric.toUpperCase(Locale.ROOT)) {
+        return switch (normalizeDistanceMetric(metric)) {
             case "COSINE" -> "Cosine";
-            case "EUCLID", "L2" -> "Euclid";
-            case "DOT", "IP" -> "Dot";
+            case "EUCLID" -> "Euclid";
+            case "DOT" -> "Dot";
+            default -> throw new BizException("unsupported distance metric: " + metric);
+        };
+    }
+
+    private String normalizeDistanceMetric(String metric) {
+        if (metric == null || metric.isBlank()) {
+            throw new BizException("distance metric must not be blank");
+        }
+        return switch (metric.trim().toUpperCase(Locale.ROOT)) {
+            case "COSINE" -> "COSINE";
+            case "EUCLID", "EUCLIDEAN", "L2" -> "EUCLID";
+            case "DOT", "IP" -> "DOT";
             default -> throw new BizException("unsupported distance metric: " + metric);
         };
     }
@@ -416,5 +585,11 @@ public class QdrantVectorEngineAdminAdapter implements VectorEngineAdminPort, Ve
             return "qdrant " + action + " failed, status=" + ex.getStatusCode().value();
         }
         return "qdrant " + action + " failed, status=" + ex.getStatusCode().value() + ", body=" + body;
+    }
+
+    private record QdrantCollectionConfig(VectorConfig unnamedVector, Map<String, VectorConfig> namedVectors) {
+    }
+
+    private record VectorConfig(int size, String distance) {
     }
 }

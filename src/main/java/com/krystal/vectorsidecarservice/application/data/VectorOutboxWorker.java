@@ -139,7 +139,10 @@ public class VectorOutboxWorker {
                 )
                 .orElseThrow(() -> new NonRetryableOutboxException("source row not found: " + event.sourcePk()));
         if (row.vectorBytes() == null || row.vectorBytes().length == 0) {
-            throw new NonRetryableOutboxException("source row vector is empty: " + event.sourcePk());
+            throw new NonRetryableOutboxException(
+                    "VECTOR_MISSING",
+                    "source row vector is empty: " + event.sourcePk()
+            );
         }
 
         Map<String, Object> qdrantPayload = qdrantPayload(qdrantPayloadFields, row.scalarValues());
@@ -387,6 +390,9 @@ public class VectorOutboxWorker {
     }
 
     private String errorCode(Exception ex) {
+        if (ex instanceof NonRetryableOutboxException nonRetryable && nonRetryable.errorCode() != null) {
+            return nonRetryable.errorCode();
+        }
         String code = ex.getClass().getSimpleName();
         if (code.length() <= 64) {
             return code;
@@ -398,6 +404,18 @@ public class VectorOutboxWorker {
 
         NonRetryableOutboxException(String message) {
             super(message);
+            this.errorCode = null;
+        }
+
+        NonRetryableOutboxException(String errorCode, String message) {
+            super(message);
+            this.errorCode = errorCode;
+        }
+
+        private final String errorCode;
+
+        String errorCode() {
+            return errorCode;
         }
     }
 

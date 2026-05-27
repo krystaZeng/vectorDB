@@ -97,7 +97,8 @@ public class JdbcVectorDataRepository implements VectorDataRelationalPort {
                 + String.join(", ", assignments)
                 + " WHERE "
                 + identifier(command.pkColumn(), "pkColumn")
-                + " = ?";
+                + " = ?"
+                + vectorPresencePredicate(command);
         values.add(command.pkValue());
         try {
             return jdbcTemplate.update(connection -> {
@@ -177,6 +178,43 @@ public class JdbcVectorDataRepository implements VectorDataRelationalPort {
                 .findFirst();
     }
 
+    @Override
+    public Optional<VectorRowState> findRowStateForUpdate(FindRowStateCommand command) {
+        String vectorColumn = identifier(command.vectorColumn(), "vectorColumn");
+        String rowVersionColumn = command.rowVersionColumn() == null
+                ? null
+                : identifier(command.rowVersionColumn(), "rowVersionColumn");
+        List<String> selectColumns = new ArrayList<>();
+        selectColumns.add("CASE WHEN " + vectorColumn + " IS NULL THEN 0 ELSE 1 END AS VECTOR_PRESENT");
+        if (rowVersionColumn != null) {
+            selectColumns.add(rowVersionColumn);
+        }
+        String sql = "SELECT "
+                + String.join(", ", selectColumns)
+                + " FROM "
+                + identifier(command.schemaName(), "schemaName")
+                + "."
+                + identifier(command.tableName(), "tableName")
+                + " WHERE "
+                + identifier(command.pkColumn(), "pkColumn")
+                + " = ? FOR UPDATE";
+
+        return jdbcTemplate.query(connection -> {
+                    PreparedStatement ps = connection.prepareStatement(sql);
+                    ps.setObject(1, command.pkValue());
+                    return ps;
+                }, (rs, rowNum) -> {
+                    Long rowVersion = null;
+                    if (rowVersionColumn != null) {
+                        Number value = (Number) rs.getObject(rowVersionColumn);
+                        rowVersion = value == null ? null : value.longValue();
+                    }
+                    return new VectorRowState(rs.getInt("VECTOR_PRESENT") == 1, rowVersion);
+                })
+                .stream()
+                .findFirst();
+    }
+
     private void bindValues(PreparedStatement ps, List<Object> values) throws SQLException {
         for (int i = 0; i < values.size(); i++) {
             Object value = values.get(i);
@@ -197,5 +235,16 @@ public class JdbcVectorDataRepository implements VectorDataRelationalPort {
             throw new BizException(fieldName + " must match [A-Za-z][A-Za-z0-9_]*");
         }
         return normalized;
+    }
+
+    private String vectorPresencePredicate(UpdateRowCommand command) {
+        VectorPresenceCondition condition = command.vectorPresenceCondition() == null
+                ? VectorPresenceCondition.ANY
+                : command.vectorPresenceCondition();
+        return switch (condition) {
+            case ANY -> "";
+            case PRESENT -> " AND " + identifier(command.vectorColumn(), "vectorColumn") + " IS NOT NULL";
+            case ABSENT -> " AND " + identifier(command.vectorColumn(), "vectorColumn") + " IS NULL";
+        };
     }
 }

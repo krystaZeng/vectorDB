@@ -4,6 +4,7 @@ import com.krystal.vectorsidecarservice.domain.registry.VectorColumnMeta;
 
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 
 public interface VectorMetadataPort {
 
@@ -18,4 +19,6 @@ public interface VectorMetadataPort {
     List<VectorColumnMeta> findAll();
 
     void updateStatus(long columnId, String status, String remark);
+
+    int updateStatusIfCurrentIn(long columnId, String status, String remark, Set<String> currentStatuses);
 }

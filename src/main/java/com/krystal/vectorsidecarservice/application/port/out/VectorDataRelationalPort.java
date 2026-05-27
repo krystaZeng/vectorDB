@@ -14,6 +14,14 @@ public interface VectorDataRelationalPort {
 
     Optional<VectorRow> findByPk(FindRowCommand command);
 
+    Optional<VectorRowState> findRowStateForUpdate(FindRowStateCommand command);
+
+    enum VectorPresenceCondition {
+        ANY,
+        PRESENT,
+        ABSENT
+    }
+
     record InsertRowCommand(
             String schemaName,
             String tableName,
@@ -36,7 +44,8 @@ public interface VectorDataRelationalPort {
             byte[] vectorBytes,
             String rowVersionColumn,
             Long rowVersion,
-            Map<String, Object> scalarValues
+            Map<String, Object> scalarValues,
+            VectorPresenceCondition vectorPresenceCondition
     ) {
     }
 
@@ -60,5 +69,18 @@ public interface VectorDataRelationalPort {
     }
 
     record VectorRow(byte[] vectorBytes, Long rowVersion, Map<String, Object> scalarValues) {
+    }
+
+    record FindRowStateCommand(
+            String schemaName,
+            String tableName,
+            String pkColumn,
+            Object pkValue,
+            String vectorColumn,
+            String rowVersionColumn
+    ) {
+    }
+
+    record VectorRowState(boolean vectorPresent, Long rowVersion) {
     }
 }

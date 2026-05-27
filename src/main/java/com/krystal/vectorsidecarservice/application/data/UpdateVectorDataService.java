@@ -9,6 +9,7 @@ import com.krystal.vectorsidecarservice.application.port.out.VectorMetadataPort;
 import com.krystal.vectorsidecarservice.application.port.out.VectorOutboxEventPort;
 import com.krystal.vectorsidecarservice.application.port.out.VectorPayloadFieldPort;
 import com.krystal.vectorsidecarservice.application.port.out.VectorSourceVersionPort;
+import com.krystal.vectorsidecarservice.application.port.out.VectorDataRelationalPort.VectorPresenceCondition;
 import com.krystal.vectorsidecarservice.application.registry.lifecycle.VectorColumnLifecycle;
 import com.krystal.vectorsidecarservice.common.exception.BizException;
 import com.krystal.vectorsidecarservice.domain.data.VectorOutboxEventMeta;
@@ -61,6 +62,9 @@ public class UpdateVectorDataService implements UpdateVectorDataUseCase {
         if (command.pk() == null) {
             throw new BizException("pk must not be null");
         }
+        if (command.vector() != null && command.vector().isEmpty()) {
+            throw new BizException("INVALID_VECTOR_VALUE: vector must not be empty");
+        }
         boolean vectorProvided = vectorProvided(command.vector());
         boolean payloadProvided = command.payload() != null && !command.payload().isEmpty();
         if (!vectorProvided && !payloadProvided) {
@@ -68,7 +72,7 @@ public class UpdateVectorDataService implements UpdateVectorDataUseCase {
         }
 
         VectorColumnMeta column = resolveColumn(tenantId, schemaName, tableName, vectorColumnName);
-        requireColumnWritableForUpdate(column, vectorProvided);
+        requireColumnWritableForUpdate(column);
 
         byte[] vectorBytes = vectorProvided
                 ? vectorValueEncoder.encode(command.vector(), column.dimension(), column.vectorEncoding())
@@ -79,8 +83,19 @@ public class UpdateVectorDataService implements UpdateVectorDataUseCase {
         String rowVersionColumn = relationalSchemaPort.columnExists(column.schemaName(), column.tableName(), ROW_VERSION_COLUMN)
                 ? ROW_VERSION_COLUMN
                 : null;
-        if (!rowExists(column, command.pk(), rowVersionColumn)) {
-            throw new BizException("row not found for update: " + pointIdNormalizer.relationalPkText(command.pk()));
+        VectorDataRelationalPort.VectorRowState rowState = findRowStateForUpdate(column, command.pk(), rowVersionColumn);
+        boolean syncPayloadChanged = !payloadValues.qdrantPayload().isEmpty();
+        boolean qdrantSyncWillHappen = vectorProvided || (syncPayloadChanged && rowState.vectorPresent());
+        boolean skipSyncBecauseVectorAbsent = !vectorProvided && syncPayloadChanged && !rowState.vectorPresent();
+        VectorPresenceCondition vectorPresenceCondition = vectorPresenceCondition(vectorProvided, syncPayloadChanged, rowState);
+        VectorCollectionMeta collection = null;
+        VectorPointIdNormalizer.NormalizedPointId pointId = null;
+        String writeTargetName = null;
+        if (qdrantSyncWillHappen) {
+            requireColumnActiveForSync(column);
+            collection = readyCollection(column.columnId());
+            pointId = pointIdNormalizer.normalize(command.pk(), collection.qdrantIdType());
+            writeTargetName = writeTargetName(collection);
         }
         long sourceVersion = nextSourceVersion(column, command.pk());
 
@@ -90,25 +105,27 @@ public class UpdateVectorDataService implements UpdateVectorDataUseCase {
                         column.tableName(),
                         column.pkColumn(),
                         command.pk(),
-                        vectorProvided ? column.vectorColumn() : null,
+                        vectorProvided || vectorPresenceCondition != VectorPresenceCondition.ANY
+                                ? column.vectorColumn()
+                                : null,
                         vectorBytes,
                         rowVersionColumn,
                         rowVersionColumn == null ? null : sourceVersion,
-                        payloadValues.scalarValues()
+                        payloadValues.scalarValues(),
+                        vectorPresenceCondition
                 )
         );
         if (updatedRows != 1) {
-            throw new BizException("row not found for update: " + pointIdNormalizer.relationalPkText(command.pk()));
+            throw new BizException("row not found or vector state changed for update: "
+                    + pointIdNormalizer.relationalPkText(command.pk()));
         }
 
-        boolean vectorSyncRequired = vectorProvided || !payloadValues.qdrantPayload().isEmpty();
-        if (!vectorSyncRequired) {
-            return relationalOnlyResult(column, sourceVersion);
+        if (!qdrantSyncWillHappen) {
+            return skipSyncBecauseVectorAbsent
+                    ? vectorAbsentResult(column, sourceVersion)
+                    : relationalOnlyResult(column, sourceVersion);
         }
 
-        VectorCollectionMeta collection = readyCollection(column.columnId());
-        VectorPointIdNormalizer.NormalizedPointId pointId = pointIdNormalizer.normalize(command.pk(), collection.qdrantIdType());
-        String writeTargetName = writeTargetName(collection);
         VectorOutboxEventMeta outboxEvent = createOutboxEvent(column, command.pk(), pointId.text(), sourceVersion);
         VectorOutboxEventPort.SaveResult outboxSaveResult = vectorOutboxEventPort.enqueueOrMergeActive(outboxEvent);
         VectorOutboxEventMeta persistedOutboxEvent = outboxSaveResult.event();
@@ -131,7 +148,7 @@ public class UpdateVectorDataService implements UpdateVectorDataUseCase {
                 persistedOutboxEvent.sourceVersion(),
                 true,
                 true,
-                "DONE".equals(persistedOutboxEvent.eventStatus()) ? "OUTBOX_DONE" : "PENDING_OUTBOX",
+                "VECTOR_SYNC_ENQUEUED",
                 outboxSaveResult.created()
                         ? "qdrant vector upsert event enqueued from update: " + persistedOutboxEvent.eventId()
                         : "qdrant vector upsert event merged from update: " + persistedOutboxEvent.eventId()
@@ -155,15 +172,18 @@ public class UpdateVectorDataService implements UpdateVectorDataUseCase {
         return columns.get(0);
     }
 
-    private void requireColumnWritableForUpdate(VectorColumnMeta column, boolean vectorProvided) {
-        if (vectorProvided && !VectorColumnLifecycle.ACTIVE.status().equals(column.status())) {
-            throw new BizException("vector column is not ACTIVE: " + column.columnId());
-        }
-        if (!vectorProvided && VectorColumnLifecycle.DISABLED.status().equals(column.status())) {
+    private void requireColumnWritableForUpdate(VectorColumnMeta column) {
+        if (VectorColumnLifecycle.DISABLED.status().equals(column.status())) {
             throw new BizException("vector column is DISABLED: " + column.columnId());
         }
         if (!relationalSchemaPort.tableExists(column.schemaName(), column.tableName())) {
             throw new BizException("table does not exist: " + column.schemaName() + "." + column.tableName());
+        }
+    }
+
+    private void requireColumnActiveForSync(VectorColumnMeta column) {
+        if (!VectorColumnLifecycle.ACTIVE.status().equals(column.status())) {
+            throw new BizException("vector column is not ACTIVE: " + column.columnId());
         }
     }
 
@@ -186,24 +206,59 @@ public class UpdateVectorDataService implements UpdateVectorDataUseCase {
                 sourceVersion,
                 true,
                 false,
-                "SKIPPED_RELATIONAL_ONLY",
+                "RELATIONAL_UPDATED_VECTOR_SYNC_NOT_REQUIRED",
                 "updated columns do not require qdrant sync"
         );
     }
 
-    private boolean rowExists(VectorColumnMeta column, Object pk, String rowVersionColumn) {
-        return vectorDataRelationalPort.findByPk(
-                        new VectorDataRelationalPort.FindRowCommand(
+    private UpdateVectorDataResult vectorAbsentResult(VectorColumnMeta column, long sourceVersion) {
+        return new UpdateVectorDataResult(
+                column.tenantId(),
+                column.schemaName(),
+                column.tableName(),
+                column.vectorColumn(),
+                column.columnId(),
+                null,
+                null,
+                null,
+                null,
+                null,
+                sourceVersion,
+                true,
+                false,
+                "RELATIONAL_UPDATED_VECTOR_SYNC_SKIPPED_NO_VECTOR",
+                "updated relational row; qdrant sync skipped because row has no vector"
+        );
+    }
+
+    private VectorDataRelationalPort.VectorRowState findRowStateForUpdate(
+            VectorColumnMeta column,
+            Object pk,
+            String rowVersionColumn
+    ) {
+        return vectorDataRelationalPort.findRowStateForUpdate(
+                        new VectorDataRelationalPort.FindRowStateCommand(
                                 column.schemaName(),
                                 column.tableName(),
                                 column.pkColumn(),
                                 pk,
                                 column.vectorColumn(),
-                                rowVersionColumn,
-                                List.of()
+                                rowVersionColumn
                         )
                 )
-                .isPresent();
+                .orElseThrow(() -> new BizException("row not found for update: "
+                        + pointIdNormalizer.relationalPkText(pk)));
+    }
+
+    private VectorPresenceCondition vectorPresenceCondition(
+            boolean vectorProvided,
+            boolean syncPayloadChanged,
+            VectorDataRelationalPort.VectorRowState rowState
+    ) {
+        if (vectorProvided || !syncPayloadChanged) {
+            return VectorPresenceCondition.ANY;
+        }
+        return rowState.vectorPresent() ? VectorPresenceCondition.PRESENT : VectorPresenceCondition.ABSENT;
     }
 
     private long nextSourceVersion(VectorColumnMeta column, Object pk) {

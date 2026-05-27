@@ -2,6 +2,7 @@ package com.krystal.vectorsidecarservice.application.registry.lifecycle;
 
 import com.krystal.vectorsidecarservice.application.port.out.VectorCollectionPort;
 import com.krystal.vectorsidecarservice.application.support.FieldValidator;
+import com.krystal.vectorsidecarservice.application.support.VectorCollectionReadinessVerifier;
 import com.krystal.vectorsidecarservice.common.exception.BizException;
 import com.krystal.vectorsidecarservice.domain.registry.VectorCollectionMeta;
 import lombok.RequiredArgsConstructor;
@@ -12,6 +13,7 @@ import org.springframework.stereotype.Service;
 public class VectorCollectionLifecycleService {
 
     private final VectorCollectionPort vectorCollectionPort;
+    private final VectorCollectionReadinessVerifier collectionReadinessVerifier;
 
     public void markCreating(long collectionId) {
         mark(collectionId, VectorCollectionLifecycle.CREATING);
@@ -47,6 +49,9 @@ public class VectorCollectionLifecycleService {
         if (!current.canTransitionTo(target)) {
             throw new BizException("invalid collection lifecycle transition: "
                     + current.display() + " -> " + target.display());
+        }
+        if (target == VectorCollectionLifecycle.READY) {
+            collectionReadinessVerifier.verifyOrThrow(currentMeta);
         }
         vectorCollectionPort.updateStatus(collectionId, target.servingState(), target.collectionStatus());
     }

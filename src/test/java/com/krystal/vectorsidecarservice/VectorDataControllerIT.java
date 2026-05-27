@@ -191,6 +191,93 @@ class VectorDataControllerIT {
     }
 
     @Test
+    void shouldUpdateScalarOnlyRowAndSkipVectorSyncWhenVectorIsAbsent() throws Exception {
+        long columnId = createVectorTable();
+        registerPayloadField(columnId);
+
+        String insertPayload = """
+                {
+                  "tenantId": "tenant_insert",
+                  "schemaName": "public",
+                  "tableName": "doc_insert",
+                  "pk": 105,
+                  "payload": {
+                    "docType": "draft"
+                  }
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/vector-data/insert")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(insertPayload))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+
+        String updatePayload = """
+                {
+                  "tenantId": "tenant_insert",
+                  "schemaName": "public",
+                  "tableName": "doc_insert",
+                  "pk": 105,
+                  "payload": {
+                    "docType": "published"
+                  }
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/vector-data/update")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(updatePayload))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.sourceVersion").value(2))
+                .andExpect(jsonPath("$.data.relationalUpdated").value(true))
+                .andExpect(jsonPath("$.data.vectorSyncEnqueued").value(false))
+                .andExpect(jsonPath("$.data.vectorSyncStatus")
+                        .value("RELATIONAL_UPDATED_VECTOR_SYNC_SKIPPED_NO_VECTOR"))
+                .andExpect(jsonPath("$.data.outboxEventId").doesNotExist());
+
+        Map<String, Object> row = jdbcTemplate.queryForMap(
+                "SELECT DOC_TYPE, ROW_VERSION, EMBEDDING FROM PUBLIC.DOC_INSERT WHERE ID = 105"
+        );
+        assertThat(row.get("DOC_TYPE")).isEqualTo("published");
+        assertThat(((Number) row.get("ROW_VERSION")).longValue()).isEqualTo(2L);
+        assertThat((byte[]) row.get("EMBEDDING")).isNull();
+
+        Integer outboxCount = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM SYS_VECTOR_OUTBOX_EVENTS_ WHERE COLUMN_ID = ? AND SOURCE_PK = '105'",
+                Integer.class,
+                columnId
+        );
+        assertThat(outboxCount).isZero();
+    }
+
+    @Test
+    void shouldRejectExplicitNullVectorOnUpdate() throws Exception {
+        createVectorTable();
+
+        String updatePayload = """
+                {
+                  "tenantId": "tenant_insert",
+                  "schemaName": "public",
+                  "tableName": "doc_insert",
+                  "pk": 106,
+                  "vector": null,
+                  "payload": {
+                    "docType": "null-vector"
+                  }
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/vector-data/update")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(updatePayload))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.message").value("INVALID_VECTOR_VALUE: vector must not be null"));
+    }
+
+    @Test
     void shouldUpdateRelationalRowAndMergeVectorUpsertOutboxEvent() throws Exception {
         long columnId = createVectorTable();
         registerReadyCollection(columnId);
@@ -222,7 +309,7 @@ class VectorDataControllerIT {
                 .andExpect(jsonPath("$.data.sourceVersion").value(2))
                 .andExpect(jsonPath("$.data.relationalUpdated").value(true))
                 .andExpect(jsonPath("$.data.vectorSyncEnqueued").value(true))
-                .andExpect(jsonPath("$.data.vectorSyncStatus").value("PENDING_OUTBOX"));
+                .andExpect(jsonPath("$.data.vectorSyncStatus").value("VECTOR_SYNC_ENQUEUED"));
 
         Map<String, Object> row = jdbcTemplate.queryForMap(
                 "SELECT DOC_TYPE, ROW_VERSION, EMBEDDING FROM PUBLIC.DOC_INSERT WHERE ID = 100"
@@ -250,6 +337,57 @@ class VectorDataControllerIT {
                 columnId
         );
         assertThat(currentVersion).isEqualTo(2L);
+    }
+
+    @Test
+    void shouldUpdateSyncPayloadOnlyAndMergeVectorUpsertOutboxEventWhenVectorExists() throws Exception {
+        long columnId = createVectorTable();
+        registerReadyCollection(columnId);
+        registerPayloadField(columnId);
+        insertVectorRow(107, "news", List.of(0.1, 0.2, 0.3));
+
+        String updatePayload = """
+                {
+                  "tenantId": "tenant_insert",
+                  "schemaName": "public",
+                  "tableName": "doc_insert",
+                  "vectorColumn": "embedding",
+                  "pk": 107,
+                  "payload": {
+                    "docType": "feature"
+                  }
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/vector-data/update")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(updatePayload))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.sourceVersion").value(2))
+                .andExpect(jsonPath("$.data.relationalUpdated").value(true))
+                .andExpect(jsonPath("$.data.vectorSyncEnqueued").value(true))
+                .andExpect(jsonPath("$.data.vectorSyncStatus").value("VECTOR_SYNC_ENQUEUED"));
+
+        Map<String, Object> row = jdbcTemplate.queryForMap(
+                "SELECT DOC_TYPE, ROW_VERSION, EMBEDDING FROM PUBLIC.DOC_INSERT WHERE ID = 107"
+        );
+        assertThat(row.get("DOC_TYPE")).isEqualTo("feature");
+        assertThat(((Number) row.get("ROW_VERSION")).longValue()).isEqualTo(2L);
+        assertThat((byte[]) row.get("EMBEDDING")).hasSize(12);
+
+        Map<String, Object> outbox = jdbcTemplate.queryForMap(
+                """
+                        SELECT EVENT_TYPE, SOURCE_OP, SOURCE_VERSION, EVENT_STATUS
+                        FROM SYS_VECTOR_OUTBOX_EVENTS_
+                        WHERE COLUMN_ID = ? AND SOURCE_PK = '107'
+                        """,
+                columnId
+        );
+        assertThat(outbox.get("EVENT_TYPE")).isEqualTo("UPSERT");
+        assertThat(outbox.get("SOURCE_OP")).isEqualTo("UPDATE");
+        assertThat(((Number) outbox.get("SOURCE_VERSION")).longValue()).isEqualTo(2L);
+        assertThat(outbox.get("EVENT_STATUS")).isEqualTo("PENDING");
     }
 
     @Test
