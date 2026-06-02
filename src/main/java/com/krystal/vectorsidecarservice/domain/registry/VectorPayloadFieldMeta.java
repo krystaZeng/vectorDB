@@ -14,6 +14,10 @@ public record VectorPayloadFieldMeta(
         String syncEnabled,
         String fieldStatus,
         String indexParamsJson,
+        String payloadIndexStatus,
+        Instant payloadIndexVerifiedAt,
+        String payloadIndexErrorCode,
+        String payloadIndexErrorMessage,
         Instant createdAt,
         Instant updatedAt
 ) {

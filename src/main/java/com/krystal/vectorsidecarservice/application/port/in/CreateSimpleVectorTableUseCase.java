@@ -61,7 +61,8 @@ public interface CreateSimpleVectorTableUseCase {
             String payloadKey,
             String fieldType,
             String syncEnabled,
-            String fieldStatus
+            String fieldStatus,
+            String payloadIndexStatus
     ) {
     }
 }

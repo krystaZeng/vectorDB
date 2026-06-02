@@ -41,7 +41,8 @@ public record CreateSimpleVectorTableResponse(
             String payloadKey,
             String fieldType,
             String syncEnabled,
-            String fieldStatus
+            String fieldStatus,
+            String payloadIndexStatus
     ) {
         static PayloadFieldResponse from(CreateSimpleVectorTableUseCase.PayloadFieldResult result) {
             return new PayloadFieldResponse(
@@ -50,7 +51,8 @@ public record CreateSimpleVectorTableResponse(
                     result.payloadKey(),
                     result.fieldType(),
                     result.syncEnabled(),
-                    result.fieldStatus()
+                    result.fieldStatus(),
+                    result.payloadIndexStatus()
             );
         }
     }

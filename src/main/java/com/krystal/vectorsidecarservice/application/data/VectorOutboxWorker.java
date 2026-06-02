@@ -37,7 +37,13 @@ public class VectorOutboxWorker {
 
     private static final Pattern IDENTIFIER_PATTERN = Pattern.compile("^[A-Za-z][A-Za-z0-9_]*$");
     private static final String ROW_VERSION_COLUMN = "ROW_VERSION";
+    private static final String VECTOR_INDEX_VERSION_COLUMN = "VECTOR_INDEX_VERSION";
+    private static final String SIDECAR_TENANT_ID_PAYLOAD_KEY = "_sidecar_tenant_id";
+    private static final String SIDECAR_COLUMN_ID_PAYLOAD_KEY = "_sidecar_column_id";
+    private static final String SIDECAR_SOURCE_PK_PAYLOAD_KEY = "_sidecar_source_pk";
+    private static final String SIDECAR_PK_VALUE_TYPE_PAYLOAD_KEY = "_sidecar_pk_value_type";
     private static final String SOURCE_VERSION_PAYLOAD_KEY = "_sidecar_source_version";
+    private static final String VECTOR_INDEX_VERSION_PAYLOAD_KEY = "_sidecar_vector_index_version";
 
     private final VectorOutboxEventPort vectorOutboxEventPort;
     private final VectorMetadataPort vectorMetadataPort;
@@ -125,6 +131,11 @@ public class VectorOutboxWorker {
         String rowVersionColumn = relationalSchemaPort.columnExists(column.schemaName(), column.tableName(), ROW_VERSION_COLUMN)
                 ? ROW_VERSION_COLUMN
                 : null;
+        String vectorIndexVersionColumn = relationalSchemaPort.columnExists(
+                column.schemaName(),
+                column.tableName(),
+                VECTOR_INDEX_VERSION_COLUMN
+        ) ? VECTOR_INDEX_VERSION_COLUMN : null;
 
         VectorDataRelationalPort.VectorRow row = vectorDataRelationalPort.findByPk(
                         new VectorDataRelationalPort.FindRowCommand(
@@ -134,6 +145,7 @@ public class VectorOutboxWorker {
                                 pointIdNormalizer.relationalPkValue(event.sourcePk(), event.pkValueType()),
                                 column.vectorColumn(),
                                 rowVersionColumn,
+                                vectorIndexVersionColumn,
                                 sourceColumns
                         )
                 )
@@ -147,7 +159,13 @@ public class VectorOutboxWorker {
 
         Map<String, Object> qdrantPayload = qdrantPayload(qdrantPayloadFields, row.scalarValues());
         long processedSourceVersion = row.rowVersion() == null ? event.sourceVersion() : row.rowVersion();
-        addSourceVersionPayload(qdrantPayload, processedSourceVersion);
+        if (row.vectorIndexVersion() == null) {
+            throw new NonRetryableOutboxException(
+                    "VECTOR_INDEX_VERSION_MISSING",
+                    "source row vector index version is missing: " + event.sourcePk()
+            );
+        }
+        addSidecarPayload(qdrantPayload, event, processedSourceVersion, row.vectorIndexVersion());
         VectorPointIdNormalizer.NormalizedPointId pointId = pointIdNormalizer.normalize(event.pointId(), collection.qdrantIdType());
         String writeTargetName = writeTargetName(collection);
         VectorEngineDataPort.UpsertPointResult result = vectorEngineDataRouter.get(collection.engineType())
@@ -216,12 +234,25 @@ public class VectorOutboxWorker {
         return payload;
     }
 
-    private void addSourceVersionPayload(Map<String, Object> payload, long sourceVersion) {
-        if (payload.containsKey(SOURCE_VERSION_PAYLOAD_KEY)) {
-            throw new NonRetryableOutboxException("reserved payload key conflicts with sidecar metadata: "
-                    + SOURCE_VERSION_PAYLOAD_KEY);
+    private void addSidecarPayload(
+            Map<String, Object> payload,
+            VectorOutboxEventMeta event,
+            long sourceVersion,
+            long vectorIndexVersion
+    ) {
+        putReservedPayload(payload, SIDECAR_TENANT_ID_PAYLOAD_KEY, event.tenantId());
+        putReservedPayload(payload, SIDECAR_COLUMN_ID_PAYLOAD_KEY, event.columnId());
+        putReservedPayload(payload, SIDECAR_SOURCE_PK_PAYLOAD_KEY, event.sourcePk());
+        putReservedPayload(payload, SIDECAR_PK_VALUE_TYPE_PAYLOAD_KEY, event.pkValueType());
+        putReservedPayload(payload, SOURCE_VERSION_PAYLOAD_KEY, sourceVersion);
+        putReservedPayload(payload, VECTOR_INDEX_VERSION_PAYLOAD_KEY, vectorIndexVersion);
+    }
+
+    private void putReservedPayload(Map<String, Object> payload, String key, Object value) {
+        if (payload.containsKey(key)) {
+            throw new NonRetryableOutboxException("reserved payload key conflicts with sidecar metadata: " + key);
         }
-        payload.put(SOURCE_VERSION_PAYLOAD_KEY, sourceVersion);
+        payload.put(key, value);
     }
 
     private void markRecoverableFailure(VectorOutboxEventMeta event, Exception ex) {
@@ -314,6 +345,7 @@ public class VectorOutboxWorker {
                                     pointIdNormalizer.relationalPkValue(event.sourcePk(), event.pkValueType()),
                                     column.vectorColumn(),
                                     rowVersionColumn,
+                                    null,
                                     List.of()
                             )
                     )

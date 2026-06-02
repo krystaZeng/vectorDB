@@ -887,6 +887,11 @@ class VectorOutboxWorkerIT {
             return DeletePointResult.deleted("point deleted");
         }
 
+        @Override
+        public SearchPointsResult searchPoints(SearchPointsCommand command) {
+            return new SearchPointsResult(List.of());
+        }
+
         void failNext(String message) {
             this.nextFailureMessage = message;
         }

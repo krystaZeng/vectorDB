@@ -40,6 +40,7 @@ import java.util.regex.Pattern;
 public class CreateVectorTableService implements CreateVectorTableUseCase {
 
     private static final String ROW_VERSION_COLUMN = AltibaseCreateTableSqlBuilder.ROW_VERSION_COLUMN;
+    private static final String VECTOR_INDEX_VERSION_COLUMN = AltibaseCreateTableSqlBuilder.VECTOR_INDEX_VERSION_COLUMN;
     private static final String DEFAULT_SCHEMA = "PUBLIC";
     private static final String DEFAULT_ENGINE_TYPE = "QDRANT";
     private static final String DEFAULT_TENANT = "DEFAULT";
@@ -547,6 +548,9 @@ public class CreateVectorTableService implements CreateVectorTableUseCase {
         List<RelationalSchemaPort.ColumnDefinition> columns = new ArrayList<>();
         columns.add(new RelationalSchemaPort.ColumnDefinition(primaryKey.name(), scalarType(primaryKey.type()), scalarLength(primaryKey.type(), null), false));
         columns.add(new RelationalSchemaPort.ColumnDefinition(ROW_VERSION_COLUMN, "BIGINT", null, false));
+        if (vectorColumn != null) {
+            columns.add(new RelationalSchemaPort.ColumnDefinition(VECTOR_INDEX_VERSION_COLUMN, "BIGINT", null, true));
+        }
         for (ScalarColumnSpec scalarColumn : scalarColumns) {
             columns.add(new RelationalSchemaPort.ColumnDefinition(
                     scalarColumn.name(),
@@ -926,6 +930,9 @@ public class CreateVectorTableService implements CreateVectorTableUseCase {
         Set<String> names = new HashSet<>();
         checkDuplicate(names, primaryKey.name(), "primaryKey.name");
         checkDuplicate(names, ROW_VERSION_COLUMN, "system.rowVersion");
+        if (vectorColumn != null) {
+            checkDuplicate(names, VECTOR_INDEX_VERSION_COLUMN, "system.vectorIndexVersion");
+        }
         for (ScalarColumnSpec scalarColumn : scalarColumns) {
             checkDuplicate(names, scalarColumn.name(), "scalarColumns.name");
         }

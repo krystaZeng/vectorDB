@@ -13,6 +13,7 @@ import java.util.Locale;
 public class AltibaseCreateTableSqlBuilder {
 
     public static final String ROW_VERSION_COLUMN = "ROW_VERSION";
+    public static final String VECTOR_INDEX_VERSION_COLUMN = "VECTOR_INDEX_VERSION";
 
     public String build(
             String schemaName,
@@ -25,6 +26,9 @@ public class AltibaseCreateTableSqlBuilder {
         List<String> columnDefinitions = new ArrayList<>();
         columnDefinitions.add("    " + primaryKey.name() + " " + normalizeScalarType(primaryKey.type(), null) + " NOT NULL");
         columnDefinitions.add("    " + ROW_VERSION_COLUMN + " BIGINT NOT NULL");
+        if (vectorColumn != null) {
+            columnDefinitions.add("    " + VECTOR_INDEX_VERSION_COLUMN + " BIGINT");
+        }
 
         for (CreateVectorTableUseCase.ScalarColumnSpec scalarColumn : scalarColumns) {
             String typeDef = normalizeScalarType(scalarColumn.type(), scalarColumn.length());

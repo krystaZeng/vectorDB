@@ -35,6 +35,7 @@ public class InsertVectorDataService implements InsertVectorDataUseCase {
     private static final String DEFAULT_TENANT = "DEFAULT";
     private static final String DEFAULT_SCHEMA = "PUBLIC";
     private static final String ROW_VERSION_COLUMN = "ROW_VERSION";
+    private static final String VECTOR_INDEX_VERSION_COLUMN = "VECTOR_INDEX_VERSION";
     private static final Pattern IDENTIFIER_PATTERN = Pattern.compile("^[A-Za-z][A-Za-z0-9_]*$");
 
     private final VectorMetadataPort vectorMetadataPort;
@@ -76,6 +77,11 @@ public class InsertVectorDataService implements InsertVectorDataUseCase {
         String rowVersionColumn = relationalSchemaPort.columnExists(column.schemaName(), column.tableName(), ROW_VERSION_COLUMN)
                 ? ROW_VERSION_COLUMN
                 : null;
+        String vectorIndexVersionColumn = relationalSchemaPort.columnExists(
+                column.schemaName(),
+                column.tableName(),
+                VECTOR_INDEX_VERSION_COLUMN
+        ) ? VECTOR_INDEX_VERSION_COLUMN : null;
 
         int insertedRows = vectorDataRelationalPort.insert(
                 new VectorDataRelationalPort.InsertRowCommand(
@@ -87,6 +93,8 @@ public class InsertVectorDataService implements InsertVectorDataUseCase {
                         vectorBytes,
                         rowVersionColumn,
                         rowVersionColumn == null ? null : sourceVersion,
+                        vectorIndexVersionColumn,
+                        vectorProvided && vectorIndexVersionColumn != null ? sourceVersion : null,
                         payloadValues.scalarValues()
                 )
         );
@@ -303,6 +311,9 @@ public class InsertVectorDataService implements InsertVectorDataUseCase {
             }
             if (scalarColumn.equals(ROW_VERSION_COLUMN)) {
                 throw new BizException("payload source column must not equal row version column: " + scalarColumn);
+            }
+            if (scalarColumn.equals(VECTOR_INDEX_VERSION_COLUMN)) {
+                throw new BizException("payload source column must not equal vector index version column: " + scalarColumn);
             }
         }
     }

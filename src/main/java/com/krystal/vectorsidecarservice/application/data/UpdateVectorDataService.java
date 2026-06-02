@@ -36,6 +36,7 @@ public class UpdateVectorDataService implements UpdateVectorDataUseCase {
     private static final String DEFAULT_TENANT = "DEFAULT";
     private static final String DEFAULT_SCHEMA = "PUBLIC";
     private static final String ROW_VERSION_COLUMN = "ROW_VERSION";
+    private static final String VECTOR_INDEX_VERSION_COLUMN = "VECTOR_INDEX_VERSION";
     private static final Pattern IDENTIFIER_PATTERN = Pattern.compile("^[A-Za-z][A-Za-z0-9_]*$");
 
     private final VectorMetadataPort vectorMetadataPort;
@@ -83,6 +84,11 @@ public class UpdateVectorDataService implements UpdateVectorDataUseCase {
         String rowVersionColumn = relationalSchemaPort.columnExists(column.schemaName(), column.tableName(), ROW_VERSION_COLUMN)
                 ? ROW_VERSION_COLUMN
                 : null;
+        String vectorIndexVersionColumn = relationalSchemaPort.columnExists(
+                column.schemaName(),
+                column.tableName(),
+                VECTOR_INDEX_VERSION_COLUMN
+        ) ? VECTOR_INDEX_VERSION_COLUMN : null;
         VectorDataRelationalPort.VectorRowState rowState = findRowStateForUpdate(column, command.pk(), rowVersionColumn);
         boolean syncPayloadChanged = !payloadValues.qdrantPayload().isEmpty();
         boolean qdrantSyncWillHappen = vectorProvided || (syncPayloadChanged && rowState.vectorPresent());
@@ -111,6 +117,8 @@ public class UpdateVectorDataService implements UpdateVectorDataUseCase {
                         vectorBytes,
                         rowVersionColumn,
                         rowVersionColumn == null ? null : sourceVersion,
+                        vectorIndexVersionColumn,
+                        qdrantSyncWillHappen && vectorIndexVersionColumn != null ? sourceVersion : null,
                         payloadValues.scalarValues(),
                         vectorPresenceCondition
                 )
@@ -383,6 +391,9 @@ public class UpdateVectorDataService implements UpdateVectorDataUseCase {
             }
             if (scalarColumn.equals(ROW_VERSION_COLUMN)) {
                 throw new BizException("payload source column must not equal row version column: " + scalarColumn);
+            }
+            if (scalarColumn.equals(VECTOR_INDEX_VERSION_COLUMN)) {
+                throw new BizException("payload source column must not equal vector index version column: " + scalarColumn);
             }
         }
     }

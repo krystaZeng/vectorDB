@@ -38,6 +38,10 @@ public class JdbcVectorDataRepository implements VectorDataRelationalPort {
             columns.add(identifier(command.rowVersionColumn(), "rowVersionColumn"));
             values.add(command.rowVersion());
         }
+        if (command.vectorIndexVersionColumn() != null && command.vectorIndexVersion() != null) {
+            columns.add(identifier(command.vectorIndexVersionColumn(), "vectorIndexVersionColumn"));
+            values.add(command.vectorIndexVersion());
+        }
         for (Map.Entry<String, Object> entry : command.scalarValues().entrySet()) {
             columns.add(identifier(entry.getKey(), "scalar column"));
             values.add(entry.getValue());
@@ -84,6 +88,10 @@ public class JdbcVectorDataRepository implements VectorDataRelationalPort {
                 assignments.add(rowVersionColumn + " = ?");
                 values.add(command.rowVersion());
             }
+        }
+        if (command.vectorIndexVersionColumn() != null && command.vectorIndexVersion() != null) {
+            assignments.add(identifier(command.vectorIndexVersionColumn(), "vectorIndexVersionColumn") + " = ?");
+            values.add(command.vectorIndexVersion());
         }
         if (assignments.isEmpty()) {
             throw new BizException("update must change at least one column");
@@ -137,6 +145,9 @@ public class JdbcVectorDataRepository implements VectorDataRelationalPort {
         String rowVersionColumn = command.rowVersionColumn() == null
                 ? null
                 : identifier(command.rowVersionColumn(), "rowVersionColumn");
+        String vectorIndexVersionColumn = command.vectorIndexVersionColumn() == null
+                ? null
+                : identifier(command.vectorIndexVersionColumn(), "vectorIndexVersionColumn");
         List<String> scalarColumns = command.scalarColumns() == null ? List.of() : command.scalarColumns()
                 .stream()
                 .map(column -> identifier(column, "scalar column"))
@@ -146,6 +157,9 @@ public class JdbcVectorDataRepository implements VectorDataRelationalPort {
         selectColumns.add(vectorColumn);
         if (rowVersionColumn != null) {
             selectColumns.add(rowVersionColumn);
+        }
+        if (vectorIndexVersionColumn != null) {
+            selectColumns.add(vectorIndexVersionColumn);
         }
         selectColumns.addAll(scalarColumns);
         String sql = "SELECT "
@@ -172,10 +186,79 @@ public class JdbcVectorDataRepository implements VectorDataRelationalPort {
                         Number value = (Number) rs.getObject(rowVersionColumn);
                         rowVersion = value == null ? null : value.longValue();
                     }
-                    return new VectorRow(rs.getBytes(vectorColumn), rowVersion, scalarValues);
+                    Long vectorIndexVersion = null;
+                    if (vectorIndexVersionColumn != null) {
+                        Number value = (Number) rs.getObject(vectorIndexVersionColumn);
+                        vectorIndexVersion = value == null ? null : value.longValue();
+                    }
+                    return new VectorRow(rs.getBytes(vectorColumn), rowVersion, vectorIndexVersion, scalarValues);
                 })
                 .stream()
                 .findFirst();
+    }
+
+    @Override
+    public List<RelationalRow> queryRows(QueryRowsCommand command) {
+        String pkColumn = identifier(command.pkColumn(), "pkColumn");
+        List<String> valueColumns = normalizedColumns(command.selectColumns(), "select column");
+        List<String> sqlColumns = sqlColumns(pkColumn, null, valueColumns);
+        List<Object> values = new ArrayList<>();
+        StringBuilder sql = new StringBuilder("SELECT ")
+                .append(String.join(", ", sqlColumns))
+                .append(" FROM ")
+                .append(identifier(command.schemaName(), "schemaName"))
+                .append(".")
+                .append(identifier(command.tableName(), "tableName"));
+        appendWhere(sql, values, command.conditions());
+        appendOrderBy(sql, command.orderBy());
+        sql.append(" LIMIT ").append(requireNonNegative(command.limit(), "limit"));
+        sql.append(" OFFSET ").append(requireNonNegative(command.offset(), "offset"));
+        return jdbcTemplate.query(connection -> {
+            PreparedStatement ps = connection.prepareStatement(sql.toString());
+            bindValues(ps, values);
+            return ps;
+        }, (rs, rowNum) -> {
+            Object pk = rs.getObject(pkColumn);
+            return new RelationalRow(pk, null, rowValues(rs, pkColumn, pk, valueColumns));
+        });
+    }
+
+    @Override
+    public List<RelationalRow> findRowsByPks(FindRowsByPksCommand command) {
+        if (command.pkValues() == null || command.pkValues().isEmpty()) {
+            return List.of();
+        }
+        String pkColumn = identifier(command.pkColumn(), "pkColumn");
+        String vectorIndexVersionColumn = command.vectorIndexVersionColumn() == null
+                ? null
+                : identifier(command.vectorIndexVersionColumn(), "vectorIndexVersionColumn");
+        List<String> valueColumns = normalizedColumns(command.selectColumns(), "select column");
+        List<String> sqlColumns = sqlColumns(pkColumn, vectorIndexVersionColumn, valueColumns);
+        String placeholders = String.join(", ", command.pkValues().stream().map(value -> "?").toList());
+        String sql = "SELECT "
+                + String.join(", ", sqlColumns)
+                + " FROM "
+                + identifier(command.schemaName(), "schemaName")
+                + "."
+                + identifier(command.tableName(), "tableName")
+                + " WHERE "
+                + pkColumn
+                + " IN ("
+                + placeholders
+                + ")";
+        return jdbcTemplate.query(connection -> {
+            PreparedStatement ps = connection.prepareStatement(sql);
+            bindValues(ps, command.pkValues());
+            return ps;
+        }, (rs, rowNum) -> {
+            Object pk = rs.getObject(pkColumn);
+            Long vectorIndexVersion = null;
+            if (vectorIndexVersionColumn != null) {
+                Number value = (Number) rs.getObject(vectorIndexVersionColumn);
+                vectorIndexVersion = value == null ? null : value.longValue();
+            }
+            return new RelationalRow(pk, vectorIndexVersion, rowValues(rs, pkColumn, pk, valueColumns));
+        });
     }
 
     @Override
@@ -235,6 +318,109 @@ public class JdbcVectorDataRepository implements VectorDataRelationalPort {
             throw new BizException(fieldName + " must match [A-Za-z][A-Za-z0-9_]*");
         }
         return normalized;
+    }
+
+    private List<String> normalizedColumns(List<String> columns, String fieldName) {
+        if (columns == null || columns.isEmpty()) {
+            return List.of();
+        }
+        return columns.stream()
+                .map(column -> identifier(column, fieldName))
+                .distinct()
+                .toList();
+    }
+
+    private List<String> sqlColumns(String pkColumn, String vectorIndexVersionColumn, List<String> valueColumns) {
+        List<String> columns = new ArrayList<>();
+        columns.add(pkColumn);
+        if (vectorIndexVersionColumn != null && !vectorIndexVersionColumn.equals(pkColumn)) {
+            columns.add(vectorIndexVersionColumn);
+        }
+        for (String valueColumn : valueColumns) {
+            if (!columns.contains(valueColumn)) {
+                columns.add(valueColumn);
+            }
+        }
+        return columns;
+    }
+
+    private Map<String, Object> rowValues(
+            java.sql.ResultSet rs,
+            String pkColumn,
+            Object pk,
+            List<String> valueColumns
+    ) throws SQLException {
+        Map<String, Object> values = new LinkedHashMap<>();
+        for (String column : valueColumns) {
+            values.put(column, column.equals(pkColumn) ? pk : rs.getObject(column));
+        }
+        return values;
+    }
+
+    private void appendWhere(StringBuilder sql, List<Object> values, List<Condition> conditions) {
+        if (conditions == null || conditions.isEmpty()) {
+            return;
+        }
+        List<String> predicates = new ArrayList<>();
+        for (Condition condition : conditions) {
+            String column = identifier(condition.column(), "where field");
+            String op = condition.op() == null ? "" : condition.op().trim().toUpperCase();
+            switch (op) {
+                case "EQ" -> {
+                    predicates.add(column + " = ?");
+                    values.add(condition.value());
+                }
+                case "IN" -> {
+                    List<Object> inValues = condition.values() == null ? List.of() : condition.values();
+                    if (inValues.isEmpty()) {
+                        throw new BizException("where IN values must not be empty: " + column);
+                    }
+                    predicates.add(column + " IN (" + String.join(", ", inValues.stream().map(value -> "?").toList()) + ")");
+                    values.addAll(inValues);
+                }
+                case "GT", "GTE", "LT", "LTE" -> {
+                    predicates.add(column + " " + relationalOperator(op) + " ?");
+                    values.add(condition.value());
+                }
+                case "IS_NULL" -> predicates.add(column + " IS NULL");
+                case "IS_NOT_NULL" -> predicates.add(column + " IS NOT NULL");
+                default -> throw new BizException("unsupported where op: " + condition.op());
+            }
+        }
+        sql.append(" WHERE ").append(String.join(" AND ", predicates));
+    }
+
+    private String relationalOperator(String op) {
+        return switch (op) {
+            case "GT" -> ">";
+            case "GTE" -> ">=";
+            case "LT" -> "<";
+            case "LTE" -> "<=";
+            default -> throw new BizException("unsupported where op: " + op);
+        };
+    }
+
+    private void appendOrderBy(StringBuilder sql, List<OrderBy> orderBy) {
+        if (orderBy == null || orderBy.isEmpty()) {
+            return;
+        }
+        List<String> clauses = new ArrayList<>();
+        for (OrderBy order : orderBy) {
+            String column = identifier(order.column(), "orderBy field");
+            String direction = order.direction() == null ? "ASC" : order.direction().trim().toUpperCase();
+            if (!direction.equals("ASC") && !direction.equals("DESC")) {
+                throw new BizException("orderBy direction must be ASC or DESC");
+            }
+            clauses.add(column + " " + direction);
+        }
+        sql.append(" ORDER BY ").append(String.join(", ", clauses));
+    }
+
+    private int requireNonNegative(int value, String fieldName) {
+        if (value < 0) {
+            throw new BizException(fieldName + " must not be negative");
+        }
+        return value;
     }
 
     private String vectorPresencePredicate(UpdateRowCommand command) {

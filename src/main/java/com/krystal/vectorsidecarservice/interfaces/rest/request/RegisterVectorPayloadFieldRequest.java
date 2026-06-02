@@ -13,6 +13,7 @@ public record RegisterVectorPayloadFieldRequest(
         String isIndexed,
         String syncEnabled,
         String fieldStatus,
-        String indexParamsJson
+        String indexParamsJson,
+        String payloadIndexStatus
 ) {
 }

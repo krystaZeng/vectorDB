@@ -11,6 +11,8 @@ public interface VectorEngineDataPort {
 
     DeletePointResult deletePoint(DeletePointCommand command);
 
+    SearchPointsResult searchPoints(SearchPointsCommand command);
+
     enum UpsertPointStatus {
         UPSERTED,
         SKIPPED_DISABLED
@@ -55,6 +57,36 @@ public interface VectorEngineDataPort {
     record DeletePointCommand(
             String collectionName,
             Object pointId
+    ) {
+    }
+
+    record SearchPointsCommand(
+            String collectionName,
+            String vectorName,
+            List<Float> vector,
+            int limit,
+            Double scoreThreshold,
+            List<SearchFilterCondition> filters,
+            boolean withPayload
+    ) {
+    }
+
+    record SearchFilterCondition(
+            String payloadKey,
+            String op,
+            Object value,
+            List<Object> values,
+            String fieldType
+    ) {
+    }
+
+    record SearchPointsResult(List<SearchPointHit> hits) {
+    }
+
+    record SearchPointHit(
+            Object pointId,
+            double score,
+            Map<String, Object> payload
     ) {
     }
 }

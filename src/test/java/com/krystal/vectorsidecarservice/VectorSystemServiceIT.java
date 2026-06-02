@@ -128,6 +128,7 @@ class VectorSystemServiceIT {
                         "Y",
                         "Y",
                         "ACTIVE",
+                        null,
                         null
                 )
         );
@@ -437,6 +438,7 @@ class VectorSystemServiceIT {
                         "Y",
                         "Y",
                         "ACTIVE",
+                        null,
                         null
                 )
         ))

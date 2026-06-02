@@ -151,6 +151,7 @@ public class CreateSimpleVectorTableService implements CreateSimpleVectorTableUs
                         "Y",
                         syncEnabled,
                         "ACTIVE",
+                        null,
                         null
                 )
         );
@@ -185,7 +186,8 @@ public class CreateSimpleVectorTableService implements CreateSimpleVectorTableUs
                 meta.payloadKey(),
                 meta.fieldType(),
                 meta.syncEnabled(),
-                meta.fieldStatus()
+                meta.fieldStatus(),
+                meta.payloadIndexStatus()
         );
     }
 

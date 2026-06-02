@@ -18,14 +18,18 @@ public class JdbcVectorPayloadFieldRepository extends JdbcTimeSupport implements
     private static final String INSERT_SQL = """
             INSERT INTO SYS_VECTOR_PAYLOAD_FIELDS_ (
                 FIELD_ID, COLUMN_ID, SOURCE_COLUMN_NAME, PAYLOAD_KEY, FIELD_TYPE, IS_FILTERABLE,
-                IS_RETURNABLE, IS_INDEXED, SYNC_ENABLED, FIELD_STATUS, INDEX_PARAMS_JSON, CREATED_AT, UPDATED_AT
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                IS_RETURNABLE, IS_INDEXED, SYNC_ENABLED, FIELD_STATUS, INDEX_PARAMS_JSON,
+                PAYLOAD_INDEX_STATUS, PAYLOAD_INDEX_VERIFIED_AT, PAYLOAD_INDEX_ERROR_CODE,
+                PAYLOAD_INDEX_ERROR_MESSAGE, CREATED_AT, UPDATED_AT
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """;
 
     private static final String FIND_SQL = """
             SELECT
                 FIELD_ID, COLUMN_ID, SOURCE_COLUMN_NAME, PAYLOAD_KEY, FIELD_TYPE, IS_FILTERABLE,
-                IS_RETURNABLE, IS_INDEXED, SYNC_ENABLED, FIELD_STATUS, INDEX_PARAMS_JSON, CREATED_AT, UPDATED_AT
+                IS_RETURNABLE, IS_INDEXED, SYNC_ENABLED, FIELD_STATUS, INDEX_PARAMS_JSON,
+                PAYLOAD_INDEX_STATUS, PAYLOAD_INDEX_VERIFIED_AT, PAYLOAD_INDEX_ERROR_CODE,
+                PAYLOAD_INDEX_ERROR_MESSAGE, CREATED_AT, UPDATED_AT
             FROM SYS_VECTOR_PAYLOAD_FIELDS_
             WHERE COLUMN_ID = ?
             ORDER BY CREATED_AT DESC
@@ -49,6 +53,10 @@ public class JdbcVectorPayloadFieldRepository extends JdbcTimeSupport implements
                     payloadFieldMeta.syncEnabled(),
                     payloadFieldMeta.fieldStatus(),
                     payloadFieldMeta.indexParamsJson(),
+                    payloadFieldMeta.payloadIndexStatus(),
+                    timestamp(payloadFieldMeta.payloadIndexVerifiedAt()),
+                    payloadFieldMeta.payloadIndexErrorCode(),
+                    payloadFieldMeta.payloadIndexErrorMessage(),
                     timestamp(payloadFieldMeta.createdAt()),
                     timestamp(payloadFieldMeta.updatedAt())
             );
@@ -72,6 +80,10 @@ public class JdbcVectorPayloadFieldRepository extends JdbcTimeSupport implements
                 rs.getString("SYNC_ENABLED"),
                 rs.getString("FIELD_STATUS"),
                 rs.getString("INDEX_PARAMS_JSON"),
+                rs.getString("PAYLOAD_INDEX_STATUS"),
+                instant(rs.getTimestamp("PAYLOAD_INDEX_VERIFIED_AT")),
+                rs.getString("PAYLOAD_INDEX_ERROR_CODE"),
+                rs.getString("PAYLOAD_INDEX_ERROR_MESSAGE"),
                 instant(rs.getTimestamp("CREATED_AT")),
                 instant(rs.getTimestamp("UPDATED_AT"))
         ), columnId);

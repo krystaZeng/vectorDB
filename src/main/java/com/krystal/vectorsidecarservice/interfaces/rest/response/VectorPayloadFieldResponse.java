@@ -16,6 +16,10 @@ public record VectorPayloadFieldResponse(
         String syncEnabled,
         String fieldStatus,
         String indexParamsJson,
+        String payloadIndexStatus,
+        Instant payloadIndexVerifiedAt,
+        String payloadIndexErrorCode,
+        String payloadIndexErrorMessage,
         Instant createdAt,
         Instant updatedAt
 ) {
@@ -32,6 +36,10 @@ public record VectorPayloadFieldResponse(
                 meta.syncEnabled(),
                 meta.fieldStatus(),
                 meta.indexParamsJson(),
+                meta.payloadIndexStatus(),
+                meta.payloadIndexVerifiedAt(),
+                meta.payloadIndexErrorCode(),
+                meta.payloadIndexErrorMessage(),
                 meta.createdAt(),
                 meta.updatedAt()
         );

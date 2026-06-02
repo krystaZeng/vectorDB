@@ -5,6 +5,7 @@ import com.krystal.vectorsidecarservice.application.port.out.IdGeneratorPort;
 import com.krystal.vectorsidecarservice.application.port.out.VectorPayloadFieldPort;
 import com.krystal.vectorsidecarservice.application.support.FieldValidator;
 import com.krystal.vectorsidecarservice.application.support.VectorMetadataReferenceGuard;
+import com.krystal.vectorsidecarservice.common.exception.BizException;
 import com.krystal.vectorsidecarservice.domain.registry.VectorPayloadFieldMeta;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
@@ -19,6 +20,7 @@ import java.util.Set;
 public class RegisterVectorPayloadFieldService implements RegisterVectorPayloadFieldUseCase {
 
     private static final int MAX_PAYLOAD_INDEX_PARAMS_LEN = 2000;
+    private static final String SIDECAR_PAYLOAD_PREFIX = "_sidecar_";
 
     private final VectorPayloadFieldPort vectorPayloadFieldPort;
     private final IdGeneratorPort idGenerator;
@@ -36,6 +38,15 @@ public class RegisterVectorPayloadFieldService implements RegisterVectorPayloadF
         String syncEnabled = FieldValidator.normalizeFlag(command.syncEnabled(), "Y", "syncEnabled");
         String fieldStatus = FieldValidator.normalizeEnum(command.fieldStatus(), Set.of("ACTIVE", "DISABLED"), "ACTIVE", "fieldStatus");
         String indexParamsJson = FieldValidator.optionalTextWithMaxLength(command.indexParamsJson(), "indexParamsJson", MAX_PAYLOAD_INDEX_PARAMS_LEN);
+        String payloadIndexStatus = FieldValidator.normalizeEnum(
+                command.payloadIndexStatus(),
+                Set.of("MISSING", "CREATING", "CREATED", "FAILED"),
+                "MISSING",
+                "payloadIndexStatus"
+        );
+        if (payloadKey.toLowerCase(Locale.ROOT).startsWith(SIDECAR_PAYLOAD_PREFIX)) {
+            throw new BizException("payloadKey must not start with reserved prefix: " + SIDECAR_PAYLOAD_PREFIX);
+        }
         referenceGuard.requireColumnWritable(command.columnId());
         Instant now = Instant.now();
         VectorPayloadFieldMeta meta = new VectorPayloadFieldMeta(
@@ -50,6 +61,10 @@ public class RegisterVectorPayloadFieldService implements RegisterVectorPayloadF
                 syncEnabled,
                 fieldStatus,
                 indexParamsJson,
+                payloadIndexStatus,
+                "CREATED".equals(payloadIndexStatus) ? now : null,
+                null,
+                null,
                 now,
                 now
         );

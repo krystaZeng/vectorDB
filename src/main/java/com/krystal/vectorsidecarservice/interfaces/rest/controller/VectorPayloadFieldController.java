@@ -35,7 +35,8 @@ public class VectorPayloadFieldController {
                         request.isIndexed(),
                         request.syncEnabled(),
                         request.fieldStatus(),
-                        request.indexParamsJson()
+                        request.indexParamsJson(),
+                        request.payloadIndexStatus()
                 )
         );
         return ApiResponse.ok(VectorPayloadFieldResponse.from(result));

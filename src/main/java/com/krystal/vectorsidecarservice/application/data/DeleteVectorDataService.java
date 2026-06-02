@@ -144,6 +144,7 @@ public class DeleteVectorDataService implements DeleteVectorDataUseCase {
                                 pk,
                                 column.vectorColumn(),
                                 rowVersionColumn,
+                                null,
                                 List.of()
                         )
                 )

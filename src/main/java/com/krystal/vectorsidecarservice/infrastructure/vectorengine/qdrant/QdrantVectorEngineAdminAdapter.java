@@ -14,7 +14,9 @@ import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 import tools.jackson.databind.node.ObjectNode;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
@@ -235,6 +237,26 @@ public class QdrantVectorEngineAdminAdapter implements VectorEngineAdminPort, Ve
             return DeletePointResult.deleted("point deleted: " + command.collectionName());
         } catch (RestClientResponseException ex) {
             throw new BizException(formatHttpError("deletePoint", ex), ex);
+        }
+    }
+
+    @Override
+    public SearchPointsResult searchPoints(SearchPointsCommand command) {
+        if (!enabled) {
+            throw new BizException("qdrant search is disabled");
+        }
+        ObjectNode payload = buildSearchPointPayload(command);
+        try {
+            JsonNode response = restClient.post()
+                    .uri("/collections/{collection}/points/search", command.collectionName())
+                    .headers(this::applyApiKey)
+                    .header(HttpHeaders.CONTENT_TYPE, "application/json")
+                    .body(payload)
+                    .retrieve()
+                    .body(JsonNode.class);
+            return parseSearchResult(response);
+        } catch (RestClientResponseException ex) {
+            throw new BizException(formatHttpError("searchPoints", ex), ex);
         }
     }
 
@@ -467,6 +489,96 @@ public class QdrantVectorEngineAdminAdapter implements VectorEngineAdminPort, Ve
         throw new BizException("qdrant point id must be a number or string");
     }
 
+    private ObjectNode buildSearchPointPayload(SearchPointsCommand command) {
+        ObjectNode payload = objectMapper.createObjectNode();
+        putSearchVector(payload, command.vectorName(), command.vector());
+        payload.put("limit", command.limit());
+        payload.put("with_payload", command.withPayload());
+        if (command.scoreThreshold() != null) {
+            payload.put("score_threshold", command.scoreThreshold());
+        }
+        ObjectNode filter = buildSearchFilter(command.filters());
+        if (filter != null) {
+            payload.set("filter", filter);
+        }
+        return payload;
+    }
+
+    private void putSearchVector(ObjectNode payload, String vectorName, List<Float> vector) {
+        if (vectorName == null || vectorName.isBlank() || vectorName.equalsIgnoreCase("default")) {
+            var vectorArray = payload.putArray("vector");
+            vector.forEach(vectorArray::add);
+            return;
+        }
+        ObjectNode namedVector = objectMapper.createObjectNode();
+        namedVector.put("name", vectorName);
+        var vectorArray = namedVector.putArray("vector");
+        vector.forEach(vectorArray::add);
+        payload.set("vector", namedVector);
+    }
+
+    private ObjectNode buildSearchFilter(List<SearchFilterCondition> filters) {
+        if (filters == null || filters.isEmpty()) {
+            return null;
+        }
+        ObjectNode filter = objectMapper.createObjectNode();
+        var must = filter.putArray("must");
+        var mustNot = filter.putArray("must_not");
+        for (SearchFilterCondition condition : filters) {
+            String op = condition.op() == null ? "" : condition.op().trim().toUpperCase(Locale.ROOT);
+            if ("IS_NOT_NULL".equals(op)) {
+                ObjectNode clause = objectMapper.createObjectNode();
+                ObjectNode isNull = objectMapper.createObjectNode();
+                isNull.put("key", condition.payloadKey());
+                clause.set("is_null", isNull);
+                mustNot.add(clause);
+                continue;
+            }
+            must.add(searchFilterClause(condition, op));
+        }
+        if (must.isEmpty()) {
+            filter.remove("must");
+        }
+        if (mustNot.isEmpty()) {
+            filter.remove("must_not");
+        }
+        return filter;
+    }
+
+    private ObjectNode searchFilterClause(SearchFilterCondition condition, String op) {
+        ObjectNode clause = objectMapper.createObjectNode();
+        if ("IS_NULL".equals(op)) {
+            ObjectNode isNull = objectMapper.createObjectNode();
+            isNull.put("key", condition.payloadKey());
+            clause.set("is_null", isNull);
+            return clause;
+        }
+        clause.put("key", condition.payloadKey());
+        switch (op) {
+            case "EQ" -> {
+                ObjectNode match = objectMapper.createObjectNode();
+                putFilterScalar(match, "value", condition.value());
+                clause.set("match", match);
+            }
+            case "IN" -> {
+                ObjectNode match = objectMapper.createObjectNode();
+                var any = match.putArray("any");
+                List<Object> values = condition.values() == null ? List.of() : condition.values();
+                for (Object value : values) {
+                    addFilterScalar(any, value);
+                }
+                clause.set("match", match);
+            }
+            case "GT", "GTE", "LT", "LTE" -> {
+                ObjectNode range = objectMapper.createObjectNode();
+                putFilterScalar(range, qdrantRangeOperator(op), condition.value());
+                clause.set("range", range);
+            }
+            default -> throw new BizException("unsupported qdrant filter op: " + condition.op());
+        }
+        return clause;
+    }
+
     private void putPointId(ObjectNode point, Object pointId) {
         if (pointId instanceof Number number) {
             point.put("id", number.longValue());
@@ -519,6 +631,103 @@ public class QdrantVectorEngineAdminAdapter implements VectorEngineAdminPort, Ve
             node.put(key, number.doubleValue());
         } else {
             throw new BizException("qdrant payload value must be scalar for key: " + key);
+        }
+    }
+
+    private void putFilterScalar(ObjectNode node, String key, Object value) {
+        requireFilterScalar(value);
+        putScalar(node, key, value);
+    }
+
+    private void addFilterScalar(tools.jackson.databind.node.ArrayNode array, Object value) {
+        requireFilterScalar(value);
+        addScalar(array, value);
+    }
+
+    private void requireFilterScalar(Object value) {
+        if (value == null) {
+            throw new BizException("qdrant filter value must not be null");
+        }
+        if (value instanceof Number number && !Double.isFinite(number.doubleValue())) {
+            throw new BizException("qdrant filter value must be a finite number");
+        }
+    }
+
+    private void addScalar(tools.jackson.databind.node.ArrayNode array, Object value) {
+        if (value == null) {
+            array.addNull();
+        } else if (value instanceof String text) {
+            array.add(text);
+        } else if (value instanceof Integer number) {
+            array.add(number);
+        } else if (value instanceof Long number) {
+            array.add(number);
+        } else if (value instanceof Float number) {
+            array.add(number);
+        } else if (value instanceof Double number) {
+            array.add(number);
+        } else if (value instanceof Boolean bool) {
+            array.add(bool);
+        } else if (value instanceof Number number) {
+            array.add(number.doubleValue());
+        } else {
+            throw new BizException("qdrant payload filter value must be scalar");
+        }
+    }
+
+    private String qdrantRangeOperator(String op) {
+        return switch (op) {
+            case "GT" -> "gt";
+            case "GTE" -> "gte";
+            case "LT" -> "lt";
+            case "LTE" -> "lte";
+            default -> throw new BizException("unsupported range op: " + op);
+        };
+    }
+
+    private SearchPointsResult parseSearchResult(JsonNode response) {
+        if (response == null) {
+            throw new BizException("qdrant search returned empty response");
+        }
+        JsonNode result = response.path("result");
+        if (!result.isArray()) {
+            throw new BizException("qdrant search returned invalid response");
+        }
+        List<SearchPointHit> hits = new ArrayList<>();
+        for (JsonNode hit : result.values()) {
+            Object pointId = treeToObject(hit.path("id"), "qdrant search hit id");
+            double score = hit.path("score").asDouble();
+            if (!Double.isFinite(score)) {
+                throw new BizException("qdrant search hit score is invalid");
+            }
+            hits.add(new SearchPointHit(pointId, score, payloadMap(hit.path("payload"))));
+        }
+        return new SearchPointsResult(hits);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> payloadMap(JsonNode payload) {
+        if (payload == null || payload.isMissingNode() || payload.isNull()) {
+            return Map.of();
+        }
+        Object value = treeToObject(payload, "qdrant search payload");
+        if (value instanceof Map<?, ?> map) {
+            Map<String, Object> result = new LinkedHashMap<>();
+            for (Map.Entry<?, ?> entry : map.entrySet()) {
+                if (entry.getKey() instanceof String key) {
+                    result.put(key, entry.getValue());
+                }
+            }
+            return result;
+        }
+        throw new BizException("qdrant search payload is invalid");
+    }
+
+    private Object treeToObject(JsonNode node, String fieldName) {
+        try {
+            return objectMapper.treeToValue(node, Object.class);
+        } catch (Exception ex) {
+            throw new BizException(fieldName + " cannot be decoded", ex);
         }
     }
 

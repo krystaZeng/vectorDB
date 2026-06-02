@@ -249,6 +249,125 @@ class QdrantVectorEngineAdminAdapterTest {
         server.verify();
     }
 
+    @Test
+    void shouldSearchPointsWithFilter() {
+        server.expect(requestTo("http://qdrant.test/collections/doc_active/points/search"))
+                .andExpect(method(HttpMethod.POST))
+                .andExpect(content().string(containsString("\"limit\":10")))
+                .andExpect(content().string(containsString("\"with_payload\":true")))
+                .andExpect(content().string(containsString("\"key\":\"docType\"")))
+                .andExpect(content().string(containsString("\"value\":\"news\"")))
+                .andRespond(withSuccess("""
+                        {
+                          "status": "ok",
+                          "result": [
+                            {
+                              "id": 123,
+                              "score": 0.91,
+                              "payload": {
+                                "_sidecar_source_pk": "123",
+                                "_sidecar_vector_index_version": 7
+                              }
+                            }
+                          ]
+                        }
+                        """, MediaType.APPLICATION_JSON));
+
+        VectorEngineDataPort.SearchPointsResult result = adapter().searchPoints(
+                new VectorEngineDataPort.SearchPointsCommand(
+                        "doc_active",
+                        "default",
+                        List.of(0.1f, 0.2f, 0.3f),
+                        10,
+                        null,
+                        List.of(new VectorEngineDataPort.SearchFilterCondition(
+                                "docType",
+                                "EQ",
+                                "news",
+                                null,
+                                "STRING"
+                        )),
+                        true
+                )
+        );
+
+        assertThat(result.hits()).hasSize(1);
+        assertThat(((Number) result.hits().get(0).pointId()).longValue()).isEqualTo(123L);
+        assertThat(result.hits().get(0).score()).isEqualTo(0.91);
+        assertThat(result.hits().get(0).payload()).containsEntry("_sidecar_source_pk", "123");
+        server.verify();
+    }
+
+    @Test
+    void shouldRejectSearchWhenQdrantIsDisabled() {
+        QdrantVectorEngineAdminAdapter disabledAdapter = new QdrantVectorEngineAdminAdapter(
+                new ObjectMapper(),
+                restClientBuilder.build(),
+                false,
+                ""
+        );
+
+        assertThatThrownBy(() -> disabledAdapter.searchPoints(
+                new VectorEngineDataPort.SearchPointsCommand(
+                        "doc_active",
+                        "default",
+                        List.of(0.1f, 0.2f, 0.3f),
+                        10,
+                        null,
+                        List.of(),
+                        true
+                )
+        ))
+                .isInstanceOf(BizException.class)
+                .hasMessage("qdrant search is disabled");
+    }
+
+    @Test
+    void shouldRejectSearchFilterObjectValueDefensively() {
+        assertThatThrownBy(() -> adapter().searchPoints(
+                new VectorEngineDataPort.SearchPointsCommand(
+                        "doc_active",
+                        "default",
+                        List.of(0.1f, 0.2f, 0.3f),
+                        10,
+                        null,
+                        List.of(new VectorEngineDataPort.SearchFilterCondition(
+                                "docType",
+                                "EQ",
+                                Map.of("nested", "news"),
+                                null,
+                                "STRING"
+                        )),
+                        true
+                )
+        ))
+                .isInstanceOf(BizException.class)
+                .hasMessageContaining("qdrant payload value must be scalar");
+    }
+
+    @Test
+    void shouldRejectSearchFilterNonFiniteNumberDefensively() {
+        assertThatThrownBy(() -> adapter().searchPoints(
+                new VectorEngineDataPort.SearchPointsCommand(
+                        "doc_active",
+                        "default",
+                        List.of(0.1f, 0.2f, 0.3f),
+                        10,
+                        null,
+                        List.of(new VectorEngineDataPort.SearchFilterCondition(
+                                "score",
+                                "EQ",
+                                Double.NaN,
+                                null,
+                                "DOUBLE"
+                        )),
+                        true
+                )
+        ))
+                .isInstanceOf(BizException.class)
+                .hasMessageContaining("qdrant filter value must be a finite number");
+    }
+
     private QdrantVectorEngineAdminAdapter adapter() {
         return new QdrantVectorEngineAdminAdapter(
                 new ObjectMapper(),
